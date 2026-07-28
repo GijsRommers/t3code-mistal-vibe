@@ -403,7 +403,7 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
     }).pipe(Effect.scoped, Effect.timeout("6 seconds"), TestClock.withLive),
   );
 
-  it.effect("rejects a concurrent turn instead of opening a second Vibe turn", () =>
+  it.effect("steers a running turn instead of opening a second Vibe turn", () =>
     Effect.gen(function* () {
       const tempDir = yield* Effect.promise(() =>
         NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "vibe-concurrent-turn-")),
@@ -412,7 +412,7 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
       const wrapperPath = yield* Effect.promise(() =>
         makeMockVibeWrapper({
           T3_ACP_REQUEST_LOG_PATH: requestLogPath,
-          T3_ACP_SET_CONFIG_OPTION_DELAY_MS: "300",
+          T3_ACP_PROMPT_DELAY_MS: "1200",
         }),
       );
       const adapter = yield* makeTestAdapter(wrapperPath);
@@ -442,15 +442,14 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
             options: [{ id: "thinking", value: "low" }],
           },
         })
-        .pipe(Effect.exit, Effect.forkChild);
-      yield* waitForFileOccurrences(requestLogPath, '"method":"session/set_config_option"', 2);
+        .pipe(Effect.forkChild);
+      yield* waitForFileOccurrences(requestLogPath, '"method":"session/prompt"', 1);
       const second = yield* adapter
         .sendTurn({ threadId, input: "second concurrent turn", attachments: [] })
-        .pipe(Effect.exit);
+        .pipe(Effect.timeout("4 seconds"));
       const first = yield* Fiber.join(firstFiber);
 
-      assert.isTrue(Exit.isSuccess(first));
-      assert.isTrue(Exit.isFailure(second));
+      assert.equal(String(first.turnId), String(second.turnId));
 
       const started = events.filter(
         (event) => event.type === "turn.started" && event.threadId === threadId,
@@ -465,6 +464,12 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
         ["completed"],
       );
       assert.equal(completed[0]?.turnId, started[0]?.turnId);
+      const requests = yield* waitForFileOccurrences(
+        requestLogPath,
+        '"method":"session/prompt"',
+        2,
+      );
+      assert.equal(requests.split('"method":"session/prompt"').length - 1, 2);
 
       yield* Fiber.interrupt(eventsFiber);
       yield* adapter.stopSession(threadId);

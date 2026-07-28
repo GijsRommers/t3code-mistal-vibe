@@ -84,6 +84,8 @@ interface VibeSessionContext {
   notificationFiber?: Fiber.Fiber<void, never>;
   activeTurnId?: TurnId;
   promptStartedSignal?: Deferred.Deferred<void>;
+  promptsInFlight: number;
+  startedPromptsInFlight: number;
   turnPreparationInProgress: boolean;
   interruptPreparationRequested: boolean;
   stopped: boolean;
@@ -409,6 +411,8 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
           session,
           turns: [],
           interruptedTurnIds: new Set(),
+          promptsInFlight: 0,
+          startedPromptsInFlight: 0,
           turnPreparationInProgress: false,
           interruptPreparationRequested: false,
           stopped: false,
@@ -549,20 +553,52 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
         return true;
       });
 
+    const settlePromptInFlight = (
+      ctx: VibeSessionContext,
+      turnId: TurnId,
+      options?: {
+        readonly promptStarted?: boolean;
+        readonly payload?: Extract<ProviderRuntimeEvent, { type: "turn.completed" }>["payload"];
+      },
+    ) =>
+      Effect.gen(function* () {
+        if (ctx.stopped || sessions.get(ctx.threadId) !== ctx) {
+          return false;
+        }
+        if (options?.promptStarted) {
+          ctx.startedPromptsInFlight = Math.max(0, ctx.startedPromptsInFlight - 1);
+        }
+        const remainingPrompts = Math.max(0, ctx.promptsInFlight - 1);
+        ctx.promptsInFlight = remainingPrompts;
+        if (
+          remainingPrompts > 0 ||
+          !vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId) ||
+          !options?.payload
+        ) {
+          return false;
+        }
+        return yield* settleActiveTurn(ctx, turnId, options.payload);
+      });
+
     /**
-     * Claims the thread's single turn slot under the per-thread lock. Both the
-     * active-turn check and the configuration RPCs happen inside the lock, so
-     * concurrent sendTurn calls can neither both pass the check nor interleave
-     * their session configuration. The prompt is also started under the lock
-     * to ensure the activeTurnId is not prematurely set, preventing race conditions
-     * with rapid successive messages.
+     * Prepares a `sendTurn` under the per-thread lock.
+     *
+     * The adapter allows a concurrent `sendTurn` to steer into the active
+     * turn id (instead of opening a second turn). Both the active-turn
+     * decision and the session configuration happen inside the lock, so
+     * concurrent sends can neither both interleave configuration nor create
+     * inconsistent turn ids. The prompt request is started while still holding
+     * the lock to reduce race conditions with rapid successive messages.
      */
     const prepareAndStartTurn = (input: Parameters<VibeAdapterShape["sendTurn"]>[0]) =>
       withThreadLock(
         input.threadId,
         Effect.gen(function* () {
           const ctx = yield* requireSession(input.threadId);
-          if (ctx.activeTurnId) {
+          const activeTurnId = ctx.activeTurnId;
+          const steeringTurnId =
+            activeTurnId && !ctx.interruptedTurnIds.has(activeTurnId) ? activeTurnId : undefined;
+          if (activeTurnId && steeringTurnId === undefined) {
             return yield* new ProviderAdapterValidationError({
               provider: PROVIDER,
               operation: "sendTurn",
@@ -624,8 +660,9 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
               issue: "Turn requires non-empty text or attachments.",
             });
           }
-          const turnId = TurnId.make(yield* nextId);
+          const turnId = steeringTurnId ?? TurnId.make(yield* nextId);
           const promptStartedSignal = yield* Deferred.make<void>();
+          ctx.promptsInFlight += 1;
           ctx.activeTurnId = turnId;
           ctx.promptStartedSignal = promptStartedSignal;
           if (ctx.interruptPreparationRequested) {
@@ -638,20 +675,26 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
             updatedAt: yield* nowIso,
             model: resolveVibeModelId(modelSelection?.model ?? ctx.session.model),
           };
-          yield* publish({
-            type: "turn.started",
-            ...(yield* stamp()),
-            provider: PROVIDER,
-            threadId: input.threadId,
-            turnId,
-            payload: { model: ctx.session.model },
-          });
+          if (steeringTurnId === undefined) {
+            yield* publish({
+              type: "turn.started",
+              ...(yield* stamp()),
+              provider: PROVIDER,
+              threadId: input.threadId,
+              turnId,
+              payload: { model: ctx.session.model },
+            });
+          }
           const fiber = yield* ctx.acp.prompt({ prompt }).pipe(Effect.forkIn(ctx.scope));
           yield* Effect.raceFirst(
             Deferred.await(promptStartedSignal),
             Fiber.await(fiber).pipe(Effect.asVoid),
           );
-          return { ctx, turnId, prompt, promptStartedSignal, fiber, modelSelection };
+          const promptStarted = yield* Deferred.isDone(promptStartedSignal);
+          if (promptStarted) {
+            ctx.startedPromptsInFlight += 1;
+          }
+          return { ctx, turnId, prompt, fiber, promptStarted };
         }).pipe(
           Effect.ensuring(
             Effect.sync(() => {
@@ -667,13 +710,13 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
 
     const sendTurn: VibeAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
-        const { ctx, turnId, prompt, fiber, modelSelection } = yield* prepareAndStartTurn(input);
+        const { ctx, turnId, prompt, fiber, promptStarted } = yield* prepareAndStartTurn(input);
         if (ctx.interruptedTurnIds.has(turnId)) {
           yield* withThreadLock(
             input.threadId,
-            settleActiveTurn(ctx, turnId, {
-              state: "cancelled",
-              stopReason: "cancelled",
+            settlePromptInFlight(ctx, turnId, {
+              promptStarted,
+              payload: { state: "cancelled", stopReason: "cancelled" },
             }),
           );
           return { threadId: input.threadId, turnId, resumeCursor: ctx.session.resumeCursor };
@@ -685,9 +728,12 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
               yield* drainVibeEventsUnlessStopped(ctx.acp.drainEvents, ctx.stoppedSignal);
               yield* withThreadLock(
                 input.threadId,
-                settleActiveTurn(ctx, turnId, {
-                  state: "failed",
-                  errorMessage: cause.message || "Mistral Vibe prompt request failed.",
+                settlePromptInFlight(ctx, turnId, {
+                  promptStarted,
+                  payload: {
+                    state: "failed",
+                    errorMessage: cause.message || "Mistral Vibe prompt request failed.",
+                  },
                 }),
               );
             }).pipe(Effect.catchCause(() => Effect.void)),
@@ -705,14 +751,23 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
               sessions.get(input.threadId) !== ctx ||
               !vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId)
             ) {
+              yield* settlePromptInFlight(ctx, turnId, { promptStarted });
               return;
             }
-            ctx.turns.push({ id: turnId, items: [{ prompt, result }] });
+            const turnRecord = ctx.turns.find((turn) => turn.id === turnId);
+            if (turnRecord) {
+              turnRecord.items.push({ prompt, result });
+            } else {
+              ctx.turns.push({ id: turnId, items: [{ prompt, result }] });
+            }
             const wasInterrupted = ctx.interruptedTurnIds.has(turnId);
-            yield* settleActiveTurn(ctx, turnId, {
-              state:
-                wasInterrupted || result.stopReason === "cancelled" ? "cancelled" : "completed",
-              stopReason: wasInterrupted ? "cancelled" : result.stopReason,
+            yield* settlePromptInFlight(ctx, turnId, {
+              promptStarted,
+              payload: {
+                state:
+                  wasInterrupted || result.stopReason === "cancelled" ? "cancelled" : "completed",
+                stopReason: wasInterrupted ? "cancelled" : result.stopReason,
+              },
             });
           }),
         );
@@ -746,12 +801,16 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
             );
             if (!activeTurnId) return Option.none<Effect.Effect<void, never>>();
             const promptStarted =
-              ctx.promptStartedSignal !== undefined &&
-              (yield* Deferred.isDone(ctx.promptStartedSignal));
-            if (!promptStarted) {
-              yield* settleActiveTurn(ctx, activeTurnId, {
-                state: "cancelled",
-                stopReason: "cancelled",
+              ctx.startedPromptsInFlight > 0 ||
+              (ctx.promptStartedSignal !== undefined &&
+                (yield* Deferred.isDone(ctx.promptStartedSignal)));
+            if (!promptStarted && ctx.startedPromptsInFlight === 0) {
+              yield* settlePromptInFlight(ctx, activeTurnId, {
+                promptStarted: false,
+                payload: {
+                  state: "cancelled",
+                  stopReason: "cancelled",
+                },
               });
               return Option.none<Effect.Effect<void, never>>();
             }
