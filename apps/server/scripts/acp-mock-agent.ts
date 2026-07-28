@@ -22,6 +22,7 @@ const emitXAiAskUserQuestion = process.env.T3_ACP_EMIT_XAI_ASK_USER_QUESTION ===
 const emitXAiPromptCompleteThenHang = process.env.T3_ACP_EMIT_XAI_PROMPT_COMPLETE_THEN_HANG === "1";
 const emitForeignSessionUpdates = process.env.T3_ACP_EMIT_FOREIGN_SESSION_UPDATES === "1";
 const useVibeConfig = process.env.T3_ACP_VIBE_CONFIG === "1";
+const vibeTrustStatus = process.env.T3_ACP_VIBE_TRUST_STATUS ?? "trusted";
 const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
 const hangFirstPromptForever = process.env.T3_ACP_HANG_FIRST_PROMPT_FOREVER === "1";
 const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL === "1";
@@ -957,7 +958,10 @@ const program = Effect.gen(function* () {
   );
 
   yield* agent.handleUnknownExtRequest((method, params) => {
-    if (method === "_trust/status" || method === "_trust/decision") {
+    if (method === "_trust/status") {
+      return Effect.succeed({ trust_status: vibeTrustStatus, details: null });
+    }
+    if (method === "_trust/decision") {
       return Effect.succeed({ trust_status: "trusted", details: null });
     }
 

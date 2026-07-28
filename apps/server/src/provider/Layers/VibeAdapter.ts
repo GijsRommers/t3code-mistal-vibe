@@ -80,8 +80,12 @@ interface VibeSessionContext {
   readonly stoppedSignal: Deferred.Deferred<void>;
   session: ProviderSession;
   turns: Array<{ id: TurnId; items: Array<unknown> }>;
+  readonly interruptedTurnIds: Set<TurnId>;
   notificationFiber?: Fiber.Fiber<void, never>;
   activeTurnId?: TurnId;
+  promptStartedSignal?: Deferred.Deferred<void>;
+  turnPreparationInProgress: boolean;
+  interruptPreparationRequested: boolean;
   stopped: boolean;
 }
 
@@ -247,6 +251,7 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
         const modelSelection =
           input.modelSelection?.instanceId === instanceId ? input.modelSelection : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        let liveContext: VibeSessionContext | undefined;
         const acp = yield* makeVibeAcpRuntime({
           vibeSettings: settings,
           ...(options?.environment ? { environment: options.environment } : {}),
@@ -254,6 +259,14 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
           cwd,
           ...(resumedSessionId ? { resumeSessionId: resumedSessionId } : {}),
           clientInfo: { name: "t3-code", version: "0.0.0" },
+          requestLogger: (event) => {
+            const promptStartedSignal = liveContext?.promptStartedSignal;
+            return event.method === "session/prompt" &&
+              event.status === "started" &&
+              promptStartedSignal
+              ? Deferred.succeed(promptStartedSignal, undefined).pipe(Effect.asVoid)
+              : Effect.void;
+          },
           ...(mcpSession
             ? {
                 mcpServers: [
@@ -346,15 +359,7 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
             mapAcpToAdapterError(PROVIDER, input.threadId, "trust/status", cause),
           ),
         );
-        if (trust.trust_status === "untrusted") {
-          if (!settings.trustWorkspace) {
-            return yield* new ProviderAdapterValidationError({
-              provider: PROVIDER,
-              operation: "startSession",
-              issue:
-                "Vibe has not trusted this workspace, so repository instructions are ignored. Enable “Trust workspaces” for this Vibe instance or trust it from the Vibe CLI.",
-            });
-          }
+        if (trust.trust_status === "untrusted" && settings.trustWorkspace) {
           const trusted = yield* trustVibeWorkspace(acp, {
             cwd,
             sessionId: started.sessionId,
@@ -403,9 +408,13 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
           stoppedSignal,
           session,
           turns: [],
+          interruptedTurnIds: new Set(),
+          turnPreparationInProgress: false,
+          interruptPreparationRequested: false,
           stopped: false,
         };
         sessions.set(input.threadId, ctx);
+        liveContext = ctx;
 
         ctx.notificationFiber = yield* Stream.runForEach(acp.getEvents(), (event) =>
           Effect.gen(function* () {
@@ -507,6 +516,39 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
     const startSession: VibeAdapterShape["startSession"] = (input) =>
       withThreadLock(input.threadId, startSessionUnlocked(input));
 
+    const settleActiveTurn = (
+      ctx: VibeSessionContext,
+      turnId: TurnId,
+      payload: Extract<ProviderRuntimeEvent, { type: "turn.completed" }>["payload"],
+    ) =>
+      Effect.gen(function* () {
+        if (
+          ctx.stopped ||
+          sessions.get(ctx.threadId) !== ctx ||
+          !vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId)
+        ) {
+          return false;
+        }
+        delete ctx.activeTurnId;
+        delete ctx.promptStartedSignal;
+        ctx.interruptedTurnIds.delete(turnId);
+        const { activeTurnId: _activeTurnId, ...ready } = ctx.session;
+        ctx.session = {
+          ...ready,
+          status: "ready",
+          updatedAt: yield* nowIso,
+        };
+        yield* publish({
+          type: "turn.completed",
+          ...(yield* stamp()),
+          provider: PROVIDER,
+          threadId: ctx.threadId,
+          turnId,
+          payload,
+        });
+        return true;
+      });
+
     /**
      * Claims the thread's single turn slot under the per-thread lock. Both the
      * active-turn check and the configuration RPCs happen inside the lock, so
@@ -526,109 +568,140 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
               issue: "Mistral Vibe already has an active turn.",
             });
           }
-          const modelSelection =
-            input.modelSelection?.instanceId === instanceId ? input.modelSelection : undefined;
-          yield* applyVibeSessionConfiguration({
-            runtime: ctx.acp,
-            model: modelSelection?.model ?? ctx.session.model,
-            selections: modelSelection?.options,
-            mode: vibeModeForRuntimeMode(ctx.session.runtimeMode, input.interactionMode),
-            mapError: (cause, method) =>
-              mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
-          });
-          const text = input.input?.trim();
-          const images = yield* Effect.forEach(input.attachments ?? [], (attachment) =>
-            Effect.gen(function* () {
-              const attachmentPath = resolveAttachmentPath({
-                attachmentsDir: serverConfig.attachmentsDir,
-                attachment,
-              });
-              if (!attachmentPath) {
-                return yield* new ProviderAdapterRequestError({
-                  provider: PROVIDER,
-                  method: "session/prompt",
-                  detail: `Invalid attachment id '${attachment.id}'.`,
-                });
-              }
-              const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new ProviderAdapterRequestError({
-                      provider: PROVIDER,
-                      method: "session/prompt",
-                      detail: cause.message,
-                      cause,
-                    }),
-                ),
-              );
-              return {
-                type: "image" as const,
-                data: Buffer.from(bytes).toString("base64"),
-                mimeType: attachment.mimeType,
-              } satisfies EffectAcpSchema.ContentBlock;
-            }),
-          );
-          const prompt: Array<EffectAcpSchema.ContentBlock> = [
-            ...(text ? [{ type: "text" as const, text }] : []),
-            ...images,
-          ];
-          if (prompt.length === 0) {
-            return yield* new ProviderAdapterValidationError({
-              provider: PROVIDER,
-              operation: "sendTurn",
-              issue: "Turn requires non-empty text or attachments.",
+          ctx.turnPreparationInProgress = true;
+          ctx.interruptPreparationRequested = false;
+          return yield* Effect.gen(function* () {
+            const modelSelection =
+              input.modelSelection?.instanceId === instanceId ? input.modelSelection : undefined;
+            yield* applyVibeSessionConfiguration({
+              runtime: ctx.acp,
+              model: modelSelection?.model ?? ctx.session.model,
+              selections: modelSelection?.options,
+              mode: vibeModeForRuntimeMode(ctx.session.runtimeMode, input.interactionMode),
+              mapError: (cause, method) =>
+                mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
             });
-          }
-          const turnId = TurnId.make(yield* nextId);
-          ctx.activeTurnId = turnId;
-          ctx.session = {
-            ...ctx.session,
-            status: "running",
-            activeTurnId: turnId,
-            updatedAt: yield* nowIso,
-            model: resolveVibeModelId(modelSelection?.model ?? ctx.session.model),
-          };
-          yield* publish({
-            type: "turn.started",
-            ...(yield* stamp()),
-            provider: PROVIDER,
-            threadId: input.threadId,
-            turnId,
-            payload: { model: ctx.session.model },
-          });
-          return { ctx, turnId, prompt };
+            const text = input.input?.trim();
+            const images = yield* Effect.forEach(input.attachments ?? [], (attachment) =>
+              Effect.gen(function* () {
+                const attachmentPath = resolveAttachmentPath({
+                  attachmentsDir: serverConfig.attachmentsDir,
+                  attachment,
+                });
+                if (!attachmentPath) {
+                  return yield* new ProviderAdapterRequestError({
+                    provider: PROVIDER,
+                    method: "session/prompt",
+                    detail: `Invalid attachment id '${attachment.id}'.`,
+                  });
+                }
+                const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProviderAdapterRequestError({
+                        provider: PROVIDER,
+                        method: "session/prompt",
+                        detail: cause.message,
+                        cause,
+                      }),
+                  ),
+                );
+                return {
+                  type: "image" as const,
+                  data: Buffer.from(bytes).toString("base64"),
+                  mimeType: attachment.mimeType,
+                } satisfies EffectAcpSchema.ContentBlock;
+              }),
+            );
+            const prompt: Array<EffectAcpSchema.ContentBlock> = [
+              ...(text ? [{ type: "text" as const, text }] : []),
+              ...images,
+            ];
+            if (prompt.length === 0) {
+              return yield* new ProviderAdapterValidationError({
+                provider: PROVIDER,
+                operation: "sendTurn",
+                issue: "Turn requires non-empty text or attachments.",
+              });
+            }
+            const turnId = TurnId.make(yield* nextId);
+            const promptStartedSignal = yield* Deferred.make<void>();
+            ctx.activeTurnId = turnId;
+            ctx.promptStartedSignal = promptStartedSignal;
+            if (ctx.interruptPreparationRequested) {
+              ctx.interruptedTurnIds.add(turnId);
+            }
+            ctx.session = {
+              ...ctx.session,
+              status: "running",
+              activeTurnId: turnId,
+              updatedAt: yield* nowIso,
+              model: resolveVibeModelId(modelSelection?.model ?? ctx.session.model),
+            };
+            yield* publish({
+              type: "turn.started",
+              ...(yield* stamp()),
+              provider: PROVIDER,
+              threadId: input.threadId,
+              turnId,
+              payload: { model: ctx.session.model },
+            });
+            return { ctx, turnId, prompt, promptStartedSignal };
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                ctx.turnPreparationInProgress = false;
+                ctx.interruptPreparationRequested = false;
+              }),
+            ),
+          );
         }),
       );
 
     const sendTurn: VibeAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
-        const { ctx, turnId, prompt } = yield* prepareTurn(input);
+        const { ctx, turnId, prompt, promptStartedSignal } = yield* prepareTurn(input);
+        const promptStart = yield* withThreadLock(
+          input.threadId,
+          Effect.gen(function* () {
+            const live = sessions.get(input.threadId);
+            if (
+              live !== ctx ||
+              ctx.stopped ||
+              !vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId)
+            ) {
+              return { _tag: "Skipped" as const };
+            }
+            if (ctx.interruptedTurnIds.has(turnId)) {
+              yield* settleActiveTurn(ctx, turnId, {
+                state: "cancelled",
+                stopReason: "cancelled",
+              });
+              return { _tag: "Skipped" as const };
+            }
+            const fiber = yield* ctx.acp.prompt({ prompt }).pipe(Effect.forkIn(ctx.scope));
+            yield* Effect.raceFirst(
+              Deferred.await(promptStartedSignal),
+              Fiber.await(fiber).pipe(Effect.asVoid),
+            );
+            return { _tag: "Started" as const, fiber };
+          }),
+        );
+        if (promptStart._tag === "Skipped") {
+          return { threadId: input.threadId, turnId, resumeCursor: ctx.session.resumeCursor };
+        }
 
-        const result = yield* ctx.acp.prompt({ prompt }).pipe(
+        const result = yield* Fiber.join(promptStart.fiber).pipe(
           Effect.tapError((cause) =>
             Effect.gen(function* () {
               yield* drainVibeEventsUnlessStopped(ctx.acp.drainEvents, ctx.stoppedSignal);
-              if (ctx.stopped || !vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId)) {
-                return;
-              }
-              delete ctx.activeTurnId;
-              const { activeTurnId: _activeTurnId, ...ready } = ctx.session;
-              ctx.session = {
-                ...ready,
-                status: "ready",
-                updatedAt: yield* nowIso,
-              };
-              yield* publish({
-                type: "turn.completed",
-                ...(yield* stamp()),
-                provider: PROVIDER,
-                threadId: input.threadId,
-                turnId,
-                payload: {
+              yield* withThreadLock(
+                input.threadId,
+                settleActiveTurn(ctx, turnId, {
                   state: "failed",
                   errorMessage: cause.message || "Mistral Vibe prompt request failed.",
-                },
-              });
+                }),
+              );
             }).pipe(Effect.catchCause(() => Effect.void)),
           ),
           Effect.mapError((cause) =>
@@ -636,38 +709,65 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
           ),
         );
         yield* drainVibeEventsUnlessStopped(ctx.acp.drainEvents, ctx.stoppedSignal);
-        ctx.turns.push({ id: turnId, items: [{ prompt, result }] });
-        if (ctx.stopped || !vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId)) {
-          return { threadId: input.threadId, turnId, resumeCursor: ctx.session.resumeCursor };
-        }
-        const updatedAt = yield* nowIso;
-        delete ctx.activeTurnId;
-        const { activeTurnId: _activeTurnId, ...ready } = ctx.session;
-        ctx.session = { ...ready, status: "ready", updatedAt };
-        yield* publish({
-          type: "turn.completed",
-          ...(yield* stamp()),
-          provider: PROVIDER,
-          threadId: input.threadId,
-          turnId,
-          payload: {
-            state: result.stopReason === "cancelled" ? "cancelled" : "completed",
-            stopReason: result.stopReason,
-          },
-        });
+        yield* withThreadLock(
+          input.threadId,
+          Effect.gen(function* () {
+            if (
+              ctx.stopped ||
+              sessions.get(input.threadId) !== ctx ||
+              !vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId)
+            ) {
+              return;
+            }
+            ctx.turns.push({ id: turnId, items: [{ prompt, result }] });
+            const wasInterrupted = ctx.interruptedTurnIds.has(turnId);
+            yield* settleActiveTurn(ctx, turnId, {
+              state:
+                wasInterrupted || result.stopReason === "cancelled" ? "cancelled" : "completed",
+              stopReason: wasInterrupted ? "cancelled" : result.stopReason,
+            });
+          }),
+        );
         return { threadId: input.threadId, turnId, resumeCursor: ctx.session.resumeCursor };
       });
 
     const interruptTurn: VibeAdapterShape["interruptTurn"] = (threadId, turnId) =>
       Effect.gen(function* () {
-        const ctx = yield* requireSession(threadId);
-        const activeTurnId = ctx.activeTurnId;
-        if (turnId && activeTurnId && turnId !== activeTurnId) return;
-        yield* ctx.acp.cancel.pipe(Effect.ignore);
-        yield* Effect.forEach(
-          ctx.pendingApprovals.values(),
-          (pending) => Deferred.succeed(pending.decision, "cancel").pipe(Effect.ignore),
-          { discard: true },
+        yield* Effect.sync(() => {
+          const ctx = sessions.get(threadId);
+          if (!ctx || ctx.stopped) return;
+          const activeTurnId = ctx.activeTurnId;
+          if (turnId && activeTurnId && turnId !== activeTurnId) return;
+          if (activeTurnId) {
+            ctx.interruptedTurnIds.add(activeTurnId);
+          } else if (ctx.turnPreparationInProgress && turnId === undefined) {
+            ctx.interruptPreparationRequested = true;
+          }
+        });
+        yield* withThreadLock(
+          threadId,
+          Effect.gen(function* () {
+            const ctx = yield* requireSession(threadId);
+            const activeTurnId = ctx.activeTurnId;
+            if (turnId && activeTurnId && turnId !== activeTurnId) return;
+            yield* Effect.forEach(
+              ctx.pendingApprovals.values(),
+              (pending) => Deferred.succeed(pending.decision, "cancel").pipe(Effect.ignore),
+              { discard: true },
+            );
+            if (!activeTurnId) return;
+            const promptStarted =
+              ctx.promptStartedSignal !== undefined &&
+              (yield* Deferred.isDone(ctx.promptStartedSignal));
+            if (!promptStarted) {
+              yield* settleActiveTurn(ctx, activeTurnId, {
+                state: "cancelled",
+                stopReason: "cancelled",
+              });
+              return;
+            }
+            yield* ctx.acp.cancel.pipe(Effect.ignore);
+          }),
         );
       });
 
@@ -719,13 +819,26 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
       });
 
     const stopSession: VibeAdapterShape["stopSession"] = (threadId) =>
-      Effect.flatMap(requireSession(threadId), stopContext);
+      withThreadLock(
+        threadId,
+        Effect.suspend(() => Effect.flatMap(requireSession(threadId), stopContext)),
+      );
     const listSessions: VibeAdapterShape["listSessions"] = () =>
       Effect.succeed(Array.from(sessions.values(), (ctx) => ctx.session));
     const hasSession: VibeAdapterShape["hasSession"] = (threadId) =>
       Effect.succeed(sessions.has(threadId));
     const stopAll: VibeAdapterShape["stopAll"] = () =>
-      Effect.forEach(Array.from(sessions.values()), stopContext, { discard: true });
+      Effect.forEach(
+        Array.from(sessions.values()),
+        (ctx) =>
+          withThreadLock(
+            ctx.threadId,
+            Effect.suspend(() =>
+              sessions.get(ctx.threadId) === ctx ? stopContext(ctx) : Effect.void,
+            ),
+          ),
+        { discard: true },
+      );
 
     yield* Effect.addFinalizer(() =>
       Effect.forEach(Array.from(sessions.values()), stopContext, { discard: true }).pipe(

@@ -55,8 +55,8 @@ const vibeAdapterTestLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3code-vibe-adapter-test-",
 }).pipe(Layer.provideMerge(NodeServices.layer));
 
-const makeTestAdapter = (binaryPath: string) =>
-  makeVibeAdapter(decodeVibeSettings({ binaryPath })).pipe(Effect.orDie);
+const makeTestAdapter = (binaryPath: string, overrides?: { readonly trustWorkspace?: boolean }) =>
+  makeVibeAdapter(decodeVibeSettings({ binaryPath, ...overrides })).pipe(Effect.orDie);
 
 function waitForFileContent(filePath: string, attempts = 80): Effect.Effect<string> {
   const readAttempt = (remainingAttempts: number): Effect.Effect<string> =>
@@ -194,13 +194,154 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
     }),
   );
 
+  it.effect("starts an untrusted workspace when automatic trust is disabled", () =>
+    Effect.gen(function* () {
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "vibe-untrusted-workspace-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockVibeWrapper({
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+          T3_ACP_VIBE_TRUST_STATUS: "untrusted",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath, { trustWorkspace: false });
+      const threadId = ThreadId.make("vibe-untrusted-workspace-thread");
+
+      const session = yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("vibe"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      assert.equal(session.status, "ready");
+      const requests = yield* waitForFileContent(requestLogPath);
+      assert.include(requests, '"method":"_trust/status"');
+      assert.notInclude(requests, '"method":"_trust/decision"');
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("serializes stopSession with an in-flight session start", () =>
+    Effect.gen(function* () {
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "vibe-start-stop-race-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockVibeWrapper({
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+          T3_ACP_SET_CONFIG_OPTION_DELAY_MS: "300",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const threadId = ThreadId.make("vibe-start-stop-race-thread");
+
+      const startFiber = yield* adapter
+        .startSession({
+          threadId,
+          provider: ProviderDriverKind.make("vibe"),
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+        })
+        .pipe(Effect.forkChild);
+      yield* waitForFileContent(requestLogPath);
+      const stopFiber = yield* adapter.stopSession(threadId).pipe(Effect.forkChild);
+
+      yield* Fiber.join(startFiber);
+      yield* Fiber.join(stopFiber);
+      assert.isFalse(yield* adapter.hasSession(threadId));
+    }).pipe(Effect.scoped, Effect.timeout("4 seconds"), TestClock.withLive),
+  );
+
+  it.effect("settles a cancellation queued during turn preparation without prompting Vibe", () =>
+    Effect.gen(function* () {
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "vibe-prepare-cancel-race-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockVibeWrapper({
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+          T3_ACP_SET_CONFIG_OPTION_DELAY_MS: "300",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const threadId = ThreadId.make("vibe-prepare-cancel-race-thread");
+      const events: ProviderRuntimeEvent[] = [];
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          events.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("vibe"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const requestsAfterStart = yield* waitForFileContent(requestLogPath);
+      const initialConfigRequestCount =
+        requestsAfterStart.split('"method":"session/set_config_option"').length - 1;
+
+      const sendFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "cancel while preparing",
+          attachments: [],
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("vibe"),
+            model: "devstral-small",
+            options: [{ id: "thinking", value: "low" }],
+          },
+        })
+        .pipe(Effect.forkChild);
+      yield* waitForFileOccurrences(
+        requestLogPath,
+        '"method":"session/set_config_option"',
+        initialConfigRequestCount + 1,
+      );
+      yield* adapter.interruptTurn(threadId);
+
+      const result = yield* Fiber.join(sendFiber);
+      yield* Effect.yieldNow;
+
+      const requests = yield* waitForFileContent(requestLogPath);
+      const started = events.filter(
+        (event) => event.type === "turn.started" && event.threadId === threadId,
+      );
+      const completed = events.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
+          event.type === "turn.completed" && event.threadId === threadId,
+      );
+      assert.lengthOf(started, 1);
+      assert.deepEqual(
+        completed.map((event) => [event.turnId, event.payload.state]),
+        [[result.turnId, "cancelled"]],
+      );
+      assert.notInclude(requests, '"method":"session/prompt"');
+
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.scoped, Effect.timeout("5 seconds"), TestClock.withLive),
+  );
+
   it.effect("keeps a cancelled prompt as the active turn until Vibe settles it", () =>
     Effect.gen(function* () {
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "vibe-in-flight-cancel-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
       const wrapperPath = yield* Effect.promise(() =>
         makeMockVibeWrapper({
           T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
           T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL: "1",
           T3_ACP_PROMPT_DELAY_MS: "200",
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
         }),
       );
       const adapter = yield* makeTestAdapter(wrapperPath);
@@ -230,6 +371,7 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
         .sendTurn({ threadId, input: "cancel the first prompt", attachments: [] })
         .pipe(Effect.forkChild);
       const firstTurnId = yield* Deferred.await(firstTurnStarted).pipe(Effect.timeout("2 seconds"));
+      yield* waitForFileOccurrences(requestLogPath, '"method":"session/prompt"', 1);
       yield* adapter.interruptTurn(threadId, firstTurnId).pipe(Effect.timeout("2 seconds"));
       yield* Fiber.join(firstSendFiber).pipe(Effect.timeout("2 seconds"));
 
@@ -258,7 +400,7 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
 
       yield* Fiber.interrupt(eventsFiber);
       yield* adapter.stopSession(threadId);
-    }).pipe(Effect.scoped, Effect.timeout("6 seconds")),
+    }).pipe(Effect.scoped, Effect.timeout("6 seconds"), TestClock.withLive),
   );
 
   it.effect("rejects a concurrent turn instead of opening a second Vibe turn", () =>
