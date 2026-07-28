@@ -553,10 +553,11 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
      * Claims the thread's single turn slot under the per-thread lock. Both the
      * active-turn check and the configuration RPCs happen inside the lock, so
      * concurrent sendTurn calls can neither both pass the check nor interleave
-     * their session configuration. The lock is released before the prompt runs
-     * so a long turn never blocks session lifecycle operations.
+     * their session configuration. The prompt is also started under the lock
+     * to ensure the activeTurnId is not prematurely set, preventing race conditions
+     * with rapid successive messages.
      */
-    const prepareTurn = (input: Parameters<VibeAdapterShape["sendTurn"]>[0]) =>
+    const prepareAndStartTurn = (input: Parameters<VibeAdapterShape["sendTurn"]>[0]) =>
       withThreadLock(
         input.threadId,
         Effect.gen(function* () {
@@ -570,128 +571,115 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
           }
           ctx.turnPreparationInProgress = true;
           ctx.interruptPreparationRequested = false;
-          return yield* Effect.gen(function* () {
-            const modelSelection =
-              input.modelSelection?.instanceId === instanceId ? input.modelSelection : undefined;
-            yield* applyVibeSessionConfiguration({
-              runtime: ctx.acp,
-              model: modelSelection?.model ?? ctx.session.model,
-              selections: modelSelection?.options,
-              mode: vibeModeForRuntimeMode(ctx.session.runtimeMode, input.interactionMode),
-              mapError: (cause, method) =>
-                mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
-            });
-            const text = input.input?.trim();
-            const images = yield* Effect.forEach(input.attachments ?? [], (attachment) =>
-              Effect.gen(function* () {
-                const attachmentPath = resolveAttachmentPath({
-                  attachmentsDir: serverConfig.attachmentsDir,
-                  attachment,
-                });
-                if (!attachmentPath) {
-                  return yield* new ProviderAdapterRequestError({
-                    provider: PROVIDER,
-                    method: "session/prompt",
-                    detail: `Invalid attachment id '${attachment.id}'.`,
-                  });
-                }
-                const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
-                  Effect.mapError(
-                    (cause) =>
-                      new ProviderAdapterRequestError({
-                        provider: PROVIDER,
-                        method: "session/prompt",
-                        detail: cause.message,
-                        cause,
-                      }),
-                  ),
-                );
-                return {
-                  type: "image" as const,
-                  data: Buffer.from(bytes).toString("base64"),
-                  mimeType: attachment.mimeType,
-                } satisfies EffectAcpSchema.ContentBlock;
-              }),
-            );
-            const prompt: Array<EffectAcpSchema.ContentBlock> = [
-              ...(text ? [{ type: "text" as const, text }] : []),
-              ...images,
-            ];
-            if (prompt.length === 0) {
-              return yield* new ProviderAdapterValidationError({
-                provider: PROVIDER,
-                operation: "sendTurn",
-                issue: "Turn requires non-empty text or attachments.",
+          const modelSelection =
+            input.modelSelection?.instanceId === instanceId ? input.modelSelection : undefined;
+          yield* applyVibeSessionConfiguration({
+            runtime: ctx.acp,
+            model: modelSelection?.model ?? ctx.session.model,
+            selections: modelSelection?.options,
+            mode: vibeModeForRuntimeMode(ctx.session.runtimeMode, input.interactionMode),
+            mapError: (cause, method) =>
+              mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
+          });
+          const text = input.input?.trim();
+          const images = yield* Effect.forEach(input.attachments ?? [], (attachment) =>
+            Effect.gen(function* () {
+              const attachmentPath = resolveAttachmentPath({
+                attachmentsDir: serverConfig.attachmentsDir,
+                attachment,
               });
-            }
-            const turnId = TurnId.make(yield* nextId);
-            const promptStartedSignal = yield* Deferred.make<void>();
-            ctx.activeTurnId = turnId;
-            ctx.promptStartedSignal = promptStartedSignal;
-            if (ctx.interruptPreparationRequested) {
-              ctx.interruptedTurnIds.add(turnId);
-            }
-            ctx.session = {
-              ...ctx.session,
-              status: "running",
-              activeTurnId: turnId,
-              updatedAt: yield* nowIso,
-              model: resolveVibeModelId(modelSelection?.model ?? ctx.session.model),
-            };
-            yield* publish({
-              type: "turn.started",
-              ...(yield* stamp()),
+              if (!attachmentPath) {
+                return yield* new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "session/prompt",
+                  detail: `Invalid attachment id '${attachment.id}'.`,
+                });
+              }
+              const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapterRequestError({
+                      provider: PROVIDER,
+                      method: "session/prompt",
+                      detail: cause.message,
+                      cause,
+                    }),
+                ),
+              );
+              return {
+                type: "image" as const,
+                data: Buffer.from(bytes).toString("base64"),
+                mimeType: attachment.mimeType,
+              } satisfies EffectAcpSchema.ContentBlock;
+            }),
+          );
+          const prompt: Array<EffectAcpSchema.ContentBlock> = [
+            ...(text ? [{ type: "text" as const, text }] : []),
+            ...images,
+          ];
+          if (prompt.length === 0) {
+            return yield* new ProviderAdapterValidationError({
               provider: PROVIDER,
-              threadId: input.threadId,
-              turnId,
-              payload: { model: ctx.session.model },
+              operation: "sendTurn",
+              issue: "Turn requires non-empty text or attachments.",
             });
-            return { ctx, turnId, prompt, promptStartedSignal };
-          }).pipe(
-            Effect.ensuring(
-              Effect.sync(() => {
+          }
+          const turnId = TurnId.make(yield* nextId);
+          const promptStartedSignal = yield* Deferred.make<void>();
+          ctx.activeTurnId = turnId;
+          ctx.promptStartedSignal = promptStartedSignal;
+          if (ctx.interruptPreparationRequested) {
+            ctx.interruptedTurnIds.add(turnId);
+          }
+          ctx.session = {
+            ...ctx.session,
+            status: "running",
+            activeTurnId: turnId,
+            updatedAt: yield* nowIso,
+            model: resolveVibeModelId(modelSelection?.model ?? ctx.session.model),
+          };
+          yield* publish({
+            type: "turn.started",
+            ...(yield* stamp()),
+            provider: PROVIDER,
+            threadId: input.threadId,
+            turnId,
+            payload: { model: ctx.session.model },
+          });
+          const fiber = yield* ctx.acp.prompt({ prompt }).pipe(Effect.forkIn(ctx.scope));
+          yield* Effect.raceFirst(
+            Deferred.await(promptStartedSignal),
+            Fiber.await(fiber).pipe(Effect.asVoid),
+          );
+          return { ctx, turnId, prompt, promptStartedSignal, fiber, modelSelection };
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              const ctx = sessions.get(input.threadId);
+              if (ctx) {
                 ctx.turnPreparationInProgress = false;
                 ctx.interruptPreparationRequested = false;
-              }),
-            ),
-          );
-        }),
+              }
+            }),
+          ),
+        ),
       );
 
     const sendTurn: VibeAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
-        const { ctx, turnId, prompt, promptStartedSignal } = yield* prepareTurn(input);
-        const promptStart = yield* withThreadLock(
-          input.threadId,
-          Effect.gen(function* () {
-            const live = sessions.get(input.threadId);
-            if (
-              live !== ctx ||
-              ctx.stopped ||
-              !vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId)
-            ) {
-              return { _tag: "Skipped" as const };
-            }
-            if (ctx.interruptedTurnIds.has(turnId)) {
-              yield* settleActiveTurn(ctx, turnId, {
-                state: "cancelled",
-                stopReason: "cancelled",
-              });
-              return { _tag: "Skipped" as const };
-            }
-            const fiber = yield* ctx.acp.prompt({ prompt }).pipe(Effect.forkIn(ctx.scope));
-            yield* Effect.raceFirst(
-              Deferred.await(promptStartedSignal),
-              Fiber.await(fiber).pipe(Effect.asVoid),
-            );
-            return { _tag: "Started" as const, fiber };
-          }),
-        );
-        if (promptStart._tag === "Skipped") {
+        const { ctx, turnId, prompt, fiber, modelSelection } = yield* prepareAndStartTurn(input);
+        if (ctx.interruptedTurnIds.has(turnId)) {
+          yield* withThreadLock(
+            input.threadId,
+            settleActiveTurn(ctx, turnId, {
+              state: "cancelled",
+              stopReason: "cancelled",
+            }),
+          );
           return { threadId: input.threadId, turnId, resumeCursor: ctx.session.resumeCursor };
         }
 
-        const result = yield* Fiber.join(promptStart.fiber).pipe(
+        const result = yield* Fiber.join(fiber).pipe(
           Effect.tapError((cause) =>
             Effect.gen(function* () {
               yield* drainVibeEventsUnlessStopped(ctx.acp.drainEvents, ctx.stoppedSignal);
