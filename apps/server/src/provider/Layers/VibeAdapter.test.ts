@@ -7,6 +7,7 @@ import * as NodeURL from "node:url";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   ProviderDriverKind,
+  ProviderInstanceId,
   type ProviderRuntimeEvent,
   ThreadId,
   TurnId,
@@ -21,6 +22,7 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import { ServerConfig } from "../../config.ts";
 import {
@@ -257,6 +259,74 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
       yield* Fiber.interrupt(eventsFiber);
       yield* adapter.stopSession(threadId);
     }).pipe(Effect.scoped, Effect.timeout("6 seconds")),
+  );
+
+  it.effect("rejects a concurrent turn instead of opening a second Vibe turn", () =>
+    Effect.gen(function* () {
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "vibe-concurrent-turn-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockVibeWrapper({
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+          T3_ACP_SET_CONFIG_OPTION_DELAY_MS: "300",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const threadId = ThreadId.make("vibe-concurrent-send-turn");
+      const events: ProviderRuntimeEvent[] = [];
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          events.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("vibe"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const firstFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "first concurrent turn",
+          attachments: [],
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("vibe"),
+            model: "mistral-medium-3.5",
+            options: [{ id: "thinking", value: "low" }],
+          },
+        })
+        .pipe(Effect.exit, Effect.forkChild);
+      yield* waitForFileOccurrences(requestLogPath, '"method":"session/set_config_option"', 2);
+      const second = yield* adapter
+        .sendTurn({ threadId, input: "second concurrent turn", attachments: [] })
+        .pipe(Effect.exit);
+      const first = yield* Fiber.join(firstFiber);
+
+      assert.isTrue(Exit.isSuccess(first));
+      assert.isTrue(Exit.isFailure(second));
+
+      const started = events.filter(
+        (event) => event.type === "turn.started" && event.threadId === threadId,
+      );
+      const completed = events.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
+          event.type === "turn.completed" && event.threadId === threadId,
+      );
+      assert.equal(started.length, 1);
+      assert.deepEqual(
+        completed.map((event) => event.payload.state),
+        ["completed"],
+      );
+      assert.equal(completed[0]?.turnId, started[0]?.turnId);
+
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.scoped, Effect.timeout("6 seconds"), TestClock.withLive),
   );
 
   it.effect("stops active ACP sessions when the adapter scope closes", () =>

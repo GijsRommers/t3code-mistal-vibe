@@ -507,87 +507,102 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
     const startSession: VibeAdapterShape["startSession"] = (input) =>
       withThreadLock(input.threadId, startSessionUnlocked(input));
 
+    /**
+     * Claims the thread's single turn slot under the per-thread lock. Both the
+     * active-turn check and the configuration RPCs happen inside the lock, so
+     * concurrent sendTurn calls can neither both pass the check nor interleave
+     * their session configuration. The lock is released before the prompt runs
+     * so a long turn never blocks session lifecycle operations.
+     */
+    const prepareTurn = (input: Parameters<VibeAdapterShape["sendTurn"]>[0]) =>
+      withThreadLock(
+        input.threadId,
+        Effect.gen(function* () {
+          const ctx = yield* requireSession(input.threadId);
+          if (ctx.activeTurnId) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "sendTurn",
+              issue: "Mistral Vibe already has an active turn.",
+            });
+          }
+          const modelSelection =
+            input.modelSelection?.instanceId === instanceId ? input.modelSelection : undefined;
+          yield* applyVibeSessionConfiguration({
+            runtime: ctx.acp,
+            model: modelSelection?.model ?? ctx.session.model,
+            selections: modelSelection?.options,
+            mode: vibeModeForRuntimeMode(ctx.session.runtimeMode, input.interactionMode),
+            mapError: (cause, method) =>
+              mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
+          });
+          const text = input.input?.trim();
+          const images = yield* Effect.forEach(input.attachments ?? [], (attachment) =>
+            Effect.gen(function* () {
+              const attachmentPath = resolveAttachmentPath({
+                attachmentsDir: serverConfig.attachmentsDir,
+                attachment,
+              });
+              if (!attachmentPath) {
+                return yield* new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "session/prompt",
+                  detail: `Invalid attachment id '${attachment.id}'.`,
+                });
+              }
+              const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapterRequestError({
+                      provider: PROVIDER,
+                      method: "session/prompt",
+                      detail: cause.message,
+                      cause,
+                    }),
+                ),
+              );
+              return {
+                type: "image" as const,
+                data: Buffer.from(bytes).toString("base64"),
+                mimeType: attachment.mimeType,
+              } satisfies EffectAcpSchema.ContentBlock;
+            }),
+          );
+          const prompt: Array<EffectAcpSchema.ContentBlock> = [
+            ...(text ? [{ type: "text" as const, text }] : []),
+            ...images,
+          ];
+          if (prompt.length === 0) {
+            return yield* new ProviderAdapterValidationError({
+              provider: PROVIDER,
+              operation: "sendTurn",
+              issue: "Turn requires non-empty text or attachments.",
+            });
+          }
+          const turnId = TurnId.make(yield* nextId);
+          ctx.activeTurnId = turnId;
+          ctx.session = {
+            ...ctx.session,
+            status: "running",
+            activeTurnId: turnId,
+            updatedAt: yield* nowIso,
+            model: resolveVibeModelId(modelSelection?.model ?? ctx.session.model),
+          };
+          yield* publish({
+            type: "turn.started",
+            ...(yield* stamp()),
+            provider: PROVIDER,
+            threadId: input.threadId,
+            turnId,
+            payload: { model: ctx.session.model },
+          });
+          return { ctx, turnId, prompt };
+        }),
+      );
+
     const sendTurn: VibeAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
-        const ctx = yield* requireSession(input.threadId);
-        if (ctx.activeTurnId) {
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "sendTurn",
-            issue: "Mistral Vibe already has an active turn.",
-          });
-        }
-        const modelSelection =
-          input.modelSelection?.instanceId === instanceId ? input.modelSelection : undefined;
-        yield* applyVibeSessionConfiguration({
-          runtime: ctx.acp,
-          model: modelSelection?.model ?? ctx.session.model,
-          selections: modelSelection?.options,
-          mode: vibeModeForRuntimeMode(ctx.session.runtimeMode, input.interactionMode),
-          mapError: (cause, method) =>
-            mapAcpToAdapterError(PROVIDER, input.threadId, method, cause),
-        });
-        const text = input.input?.trim();
-        const images = yield* Effect.forEach(input.attachments ?? [], (attachment) =>
-          Effect.gen(function* () {
-            const attachmentPath = resolveAttachmentPath({
-              attachmentsDir: serverConfig.attachmentsDir,
-              attachment,
-            });
-            if (!attachmentPath) {
-              return yield* new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "session/prompt",
-                detail: `Invalid attachment id '${attachment.id}'.`,
-              });
-            }
-            const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new ProviderAdapterRequestError({
-                    provider: PROVIDER,
-                    method: "session/prompt",
-                    detail: cause.message,
-                    cause,
-                  }),
-              ),
-            );
-            return {
-              type: "image" as const,
-              data: Buffer.from(bytes).toString("base64"),
-              mimeType: attachment.mimeType,
-            } satisfies EffectAcpSchema.ContentBlock;
-          }),
-        );
-        const prompt: Array<EffectAcpSchema.ContentBlock> = [
-          ...(text ? [{ type: "text" as const, text }] : []),
-          ...images,
-        ];
-        if (prompt.length === 0) {
-          return yield* new ProviderAdapterValidationError({
-            provider: PROVIDER,
-            operation: "sendTurn",
-            issue: "Turn requires non-empty text or attachments.",
-          });
-        }
-
-        const turnId = TurnId.make(yield* nextId);
-        ctx.activeTurnId = turnId;
-        ctx.session = {
-          ...ctx.session,
-          status: "running",
-          activeTurnId: turnId,
-          updatedAt: yield* nowIso,
-          model: resolveVibeModelId(modelSelection?.model ?? ctx.session.model),
-        };
-        yield* publish({
-          type: "turn.started",
-          ...(yield* stamp()),
-          provider: PROVIDER,
-          threadId: input.threadId,
-          turnId,
-          payload: { model: ctx.session.model },
-        });
+        const { ctx, turnId, prompt } = yield* prepareTurn(input);
 
         const result = yield* ctx.acp.prompt({ prompt }).pipe(
           Effect.tapError((cause) =>
