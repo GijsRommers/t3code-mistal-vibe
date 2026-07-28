@@ -654,19 +654,6 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
           (pending) => Deferred.succeed(pending.decision, "cancel").pipe(Effect.ignore),
           { discard: true },
         );
-        if (activeTurnId) {
-          delete ctx.activeTurnId;
-          const { activeTurnId: _activeTurnId, ...ready } = ctx.session;
-          ctx.session = { ...ready, status: "ready", updatedAt: yield* nowIso };
-          yield* publish({
-            type: "turn.completed",
-            ...(yield* stamp()),
-            provider: PROVIDER,
-            threadId,
-            turnId: activeTurnId,
-            payload: { state: "cancelled", stopReason: "cancelled" },
-          });
-        }
       });
 
     const respondToRequest: VibeAdapterShape["respondToRequest"] = (

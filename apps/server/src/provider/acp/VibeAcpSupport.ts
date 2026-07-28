@@ -101,6 +101,7 @@ export const makeVibeAcpRuntime = (
     const acpContext = yield* Layer.build(
       AcpSessionRuntime.layer({
         ...input,
+        interruptPromptOnCancel: false,
         spawn: buildVibeAcpSpawnInput(input.vibeSettings, input.cwd, input.environment),
       }).pipe(
         Layer.provide(

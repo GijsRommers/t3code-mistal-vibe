@@ -71,7 +71,7 @@ export const makeVibeTextGeneration = Effect.fn("makeVibeTextGeneration")(functi
           runtime,
           model: input.modelSelection.model,
           selections: input.modelSelection.options,
-          mode: "chat",
+          mode: "default",
           mapError: (cause, method) =>
             new TextGenerationError({
               operation: input.operation,

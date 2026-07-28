@@ -1,3 +1,7 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodePath from "node:path";
+import * as NodeURL from "node:url";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import { createModelCapabilities } from "@t3tools/shared/model";
@@ -14,6 +18,12 @@ import {
 } from "./VibeProvider.ts";
 
 const decodeVibeSettings = Schema.decodeSync(VibeSettings);
+const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
+const mockAgentPath = NodePath.join(__dirname, "../../../scripts/acp-mock-agent.ts");
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
 
 const configOptions = [
   {
@@ -78,6 +88,42 @@ describe("VibeProvider", () => {
 });
 
 it.layer(NodeServices.layer)("checkVibeProviderStatus", (it) => {
+  it.effect("does not infer authentication from successful ACP discovery", () =>
+    Effect.gen(function* () {
+      const snapshot = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-vibe-discovery-" });
+          const vibePath = path.join(dir, "vibe-acp");
+          yield* fs.writeFileString(
+            vibePath,
+            [
+              "#!/bin/sh",
+              'if [ "$1" = "--version" ]; then',
+              '  printf "vibe 0.0.99\\n"',
+              "  exit 0",
+              "fi",
+              "export T3_ACP_VIBE_CONFIG=1",
+              `exec ${shellSingleQuote(process.execPath)} ${shellSingleQuote(mockAgentPath)} "$@"`,
+              "",
+            ].join("\n"),
+          );
+          yield* fs.chmod(vibePath, 0o755);
+
+          return yield* checkVibeProviderStatus(
+            decodeVibeSettings({ enabled: true, binaryPath: vibePath }),
+          );
+        }),
+      );
+
+      expect(snapshot.installed).toBe(true);
+      expect(snapshot.status).toBe("ready");
+      expect(snapshot.auth.status).toBe("unknown");
+      expect(snapshot.models.map((model) => model.slug)).toContain("mistral-medium-3.5");
+    }),
+  );
+
   it.effect("does not claim authentication failed when ACP discovery fails", () =>
     Effect.gen(function* () {
       const snapshot = yield* Effect.scoped(

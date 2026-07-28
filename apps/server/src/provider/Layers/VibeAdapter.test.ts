@@ -5,14 +5,22 @@ import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ProviderDriverKind, ThreadId, TurnId, VibeSettings } from "@t3tools/contracts";
+import {
+  ProviderDriverKind,
+  type ProviderRuntimeEvent,
+  ThreadId,
+  TurnId,
+  VibeSettings,
+} from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 
 import { ServerConfig } from "../../config.ts";
 import {
@@ -182,6 +190,73 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
       yield* adapter.stopAll();
       assert.include(yield* waitForFileOccurrences(exitLogPath, "SIGTERM", 2), "SIGTERM");
     }),
+  );
+
+  it.effect("keeps a cancelled prompt as the active turn until Vibe settles it", () =>
+    Effect.gen(function* () {
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockVibeWrapper({
+          T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+          T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL: "1",
+          T3_ACP_PROMPT_DELAY_MS: "200",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const threadId = ThreadId.make("vibe-interrupt-turn-race");
+      const events: ProviderRuntimeEvent[] = [];
+      const firstTurnStarted = yield* Deferred.make<TurnId>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          events.push(event);
+        }).pipe(
+          Effect.andThen(
+            event.type === "turn.started" && event.turnId !== undefined
+              ? Deferred.succeed(firstTurnStarted, event.turnId).pipe(Effect.asVoid)
+              : Effect.void,
+          ),
+        ),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("vibe"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const firstSendFiber = yield* adapter
+        .sendTurn({ threadId, input: "cancel the first prompt", attachments: [] })
+        .pipe(Effect.forkChild);
+      const firstTurnId = yield* Deferred.await(firstTurnStarted).pipe(Effect.timeout("2 seconds"));
+      yield* adapter.interruptTurn(threadId, firstTurnId).pipe(Effect.timeout("2 seconds"));
+      yield* Fiber.join(firstSendFiber).pipe(Effect.timeout("2 seconds"));
+
+      const followUp = yield* adapter
+        .sendTurn({ threadId, input: "complete the follow-up", attachments: [] })
+        .pipe(Effect.timeout("2 seconds"));
+
+      const completed = events.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
+          event.type === "turn.completed" && event.threadId === threadId,
+      );
+      const lateDelta = events.find(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "content.delta" }> =>
+          event.type === "content.delta" && event.payload.delta === "late after cancel",
+      );
+
+      assert.deepEqual(
+        completed.map((event) => [event.turnId, event.payload.state]),
+        [
+          [firstTurnId, "cancelled"],
+          [followUp.turnId, "completed"],
+        ],
+      );
+      assert.equal(lateDelta?.turnId, firstTurnId);
+      assert.notEqual(lateDelta?.turnId, followUp.turnId);
+
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.scoped, Effect.timeout("6 seconds")),
   );
 
   it.effect("stops active ACP sessions when the adapter scope closes", () =>

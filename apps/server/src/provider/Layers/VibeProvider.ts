@@ -308,7 +308,7 @@ export const checkVibeProviderStatus = Effect.fn("checkVibeProviderStatus")(func
       installed: true,
       version,
       status: "ready",
-      auth: { status: "authenticated", type: "Mistral account" },
+      auth: { status: "unknown" },
     },
   });
 });

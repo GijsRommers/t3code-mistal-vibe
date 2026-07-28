@@ -57,6 +57,22 @@ let currentFast = false;
 let promptCount = 0;
 let overlappingFirstPromptId: string | undefined;
 const cancelledSessions = new Set<string>();
+const pendingCancellationResolvers = new Map<string, () => void>();
+
+function awaitCancellation(cancelledSessionId: string): Effect.Effect<void> {
+  return Effect.callback<void>((resume) => {
+    const resolve = () => resume(Effect.void);
+    pendingCancellationResolvers.set(cancelledSessionId, resolve);
+    if (cancelledSessions.has(cancelledSessionId)) {
+      resolve();
+    }
+    return Effect.sync(() => {
+      if (pendingCancellationResolvers.get(cancelledSessionId) === resolve) {
+        pendingCancellationResolvers.delete(cancelledSessionId);
+      }
+    });
+  });
+}
 
 function promptIdFromRequestMeta(
   request: Pick<AcpSchema.PromptRequest, "_meta">,
@@ -505,6 +521,7 @@ const program = Effect.gen(function* () {
           });
         });
       }
+      pendingCancellationResolvers.get(cancelledSessionId)?.();
     }),
   );
 
@@ -575,7 +592,9 @@ const program = Effect.gen(function* () {
       }
 
       if (hangPromptForever || (hangFirstPromptForever && promptCount === 1)) {
-        return yield* Effect.never;
+        yield* awaitCancellation(requestedSessionId);
+        cancelledSessions.delete(requestedSessionId);
+        return { stopReason: "cancelled" };
       }
 
       if (emitXAiPromptCompleteThenHang) {

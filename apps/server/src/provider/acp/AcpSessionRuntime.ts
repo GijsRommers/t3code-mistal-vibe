@@ -61,6 +61,13 @@ export interface AcpSessionRuntimeOptions {
   readonly spawn: AcpSpawnInput;
   readonly cwd: string;
   readonly resumeSessionId?: string;
+  /**
+   * Whether cancelling should immediately interrupt the local prompt RPC.
+   * Disable this for agents whose prompt response is the authoritative
+   * cancellation boundary, so late notifications cannot bleed into a
+   * subsequent turn.
+   */
+  readonly interruptPromptOnCancel?: boolean;
   readonly sessionLoadTimeout?: Duration.Input;
   readonly sessionLoadReplayIdleGap?: Duration.Input;
   readonly clientCapabilities?: EffectAcpSchema.InitializeRequest["clientCapabilities"];
@@ -769,13 +776,17 @@ export const make = (
       cancel: getStartedState.pipe(
         Effect.flatMap((started) =>
           Effect.gen(function* () {
-            const activePromptFiber = yield* Ref.get(activePromptFiberRef);
-            if (Option.isSome(activePromptFiber)) {
-              yield* Fiber.interrupt(activePromptFiber.value).pipe(Effect.ignore);
+            if (options.interruptPromptOnCancel !== false) {
+              const activePromptFiber = yield* Ref.get(activePromptFiberRef);
+              if (Option.isSome(activePromptFiber)) {
+                yield* Fiber.interrupt(activePromptFiber.value).pipe(Effect.ignore);
+              }
+              yield* acp.agent
+                .cancel({ sessionId: started.sessionId })
+                .pipe(Effect.ignore, Effect.forkIn(runtimeScope));
+              return;
             }
-            yield* acp.agent
-              .cancel({ sessionId: started.sessionId })
-              .pipe(Effect.ignore, Effect.forkIn(runtimeScope));
+            yield* acp.agent.cancel({ sessionId: started.sessionId });
           }),
         ),
       ),
