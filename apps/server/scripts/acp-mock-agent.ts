@@ -23,6 +23,12 @@ const emitXAiPromptCompleteThenHang = process.env.T3_ACP_EMIT_XAI_PROMPT_COMPLET
 const emitForeignSessionUpdates = process.env.T3_ACP_EMIT_FOREIGN_SESSION_UPDATES === "1";
 const useVibeConfig = process.env.T3_ACP_VIBE_CONFIG === "1";
 const vibeTrustStatus = process.env.T3_ACP_VIBE_TRUST_STATUS ?? "trusted";
+// Decisions Vibe currently has pending. Empty means no trust prompt is
+// outstanding, and `_trust/decision` is rejected the way the real agent does.
+const vibeTrustDecisions = (process.env.T3_ACP_VIBE_TRUST_DECISIONS ?? "")
+  .split(",")
+  .map((decision) => decision.trim())
+  .filter((decision) => decision.length > 0);
 const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
 const hangFirstPromptForever = process.env.T3_ACP_HANG_FIRST_PROMPT_FOREVER === "1";
 const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL === "1";
@@ -959,9 +965,31 @@ const program = Effect.gen(function* () {
 
   yield* agent.handleUnknownExtRequest((method, params) => {
     if (method === "_trust/status") {
-      return Effect.succeed({ trust_status: vibeTrustStatus, details: null });
+      return Effect.succeed({
+        trust_status: vibeTrustStatus,
+        details:
+          vibeTrustDecisions.length > 0
+            ? {
+                cwd: process.cwd(),
+                repoRoot: null,
+                ignoredFiles: [],
+                availableDecisions: vibeTrustDecisions,
+              }
+            : null,
+      });
     }
     if (method === "_trust/decision") {
+      const requested =
+        typeof params === "object" && params !== null && "decision" in params
+          ? params.decision
+          : undefined;
+      // Matches the real agent: a decision can only be answered while one is
+      // pending, otherwise `-32602 No workspace trust decision is available`.
+      if (typeof requested !== "string" || !vibeTrustDecisions.includes(requested)) {
+        return Effect.fail(
+          AcpError.AcpRequestError.invalidParams("No workspace trust decision is available."),
+        );
+      }
       return Effect.succeed({ trust_status: "trusted", details: null });
     }
 

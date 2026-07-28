@@ -212,6 +212,71 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
     }),
   );
 
+  it.effect("starts an untrusted workspace that has no trust decision pending", () =>
+    Effect.gen(function* () {
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "vibe-untrusted-no-decision-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockVibeWrapper({
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+          T3_ACP_VIBE_TRUST_STATUS: "untrusted",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath, { trustWorkspace: true });
+      const threadId = ThreadId.make("vibe-untrusted-no-decision-thread");
+
+      const session = yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("vibe"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      // Vibe rejects `_trust/decision` when nothing is pending, which used to
+      // abort the whole session with "Extension request failed".
+      assert.equal(session.status, "ready");
+      const requests = yield* waitForFileContent(requestLogPath);
+      assert.include(requests, '"method":"_trust/status"');
+      assert.notInclude(requests, '"method":"_trust/decision"');
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("answers an outstanding Vibe trust prompt with an available decision", () =>
+    Effect.gen(function* () {
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "vibe-untrusted-decision-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockVibeWrapper({
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+          T3_ACP_VIBE_TRUST_STATUS: "untrusted",
+          T3_ACP_VIBE_TRUST_DECISIONS: "trust_session,trust_cwd",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath, { trustWorkspace: true });
+      const threadId = ThreadId.make("vibe-untrusted-decision-thread");
+
+      const session = yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("vibe"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      assert.equal(session.status, "ready");
+      const requests = yield* waitForFileContent(requestLogPath);
+      assert.include(requests, '"method":"_trust/decision"');
+      assert.include(requests, '"decision":"trust_cwd"');
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("serializes stopSession with an in-flight session start", () =>
     Effect.gen(function* () {
       const tempDir = yield* Effect.promise(() =>

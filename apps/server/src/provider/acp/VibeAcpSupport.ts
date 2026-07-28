@@ -46,6 +46,32 @@ const WorkspaceTrustStatusResponse = Schema.Struct({
 export type WorkspaceTrustStatusResponse = typeof WorkspaceTrustStatusResponse.Type;
 const decodeWorkspaceTrustStatusResponse = Schema.decodeUnknownEffect(WorkspaceTrustStatusResponse);
 
+export type VibeWorkspaceTrustDecision = "trust_repo" | "trust_cwd" | "trust_session";
+
+/** Broadest grant first: trusting the repo covers later sessions in any subdir. */
+const TRUST_DECISION_PREFERENCE: ReadonlyArray<VibeWorkspaceTrustDecision> = [
+  "trust_cwd",
+  "trust_repo",
+  "trust_session",
+];
+
+/**
+ * Picks the decision to answer an outstanding Vibe trust prompt with.
+ *
+ * Vibe only accepts `_trust/decision` while it has a decision pending — it
+ * reports the acceptable ones in `details.availableDecisions` and rejects
+ * anything else with `-32602 No workspace trust decision is available`.
+ * `details` is null when nothing is pending, which is not an error: the
+ * workspace simply cannot be auto-trusted from here.
+ */
+export function selectVibeTrustDecision(
+  status: WorkspaceTrustStatusResponse,
+): VibeWorkspaceTrustDecision | undefined {
+  const available = status.details?.availableDecisions;
+  if (!available || available.length === 0) return undefined;
+  return TRUST_DECISION_PREFERENCE.find((decision) => available.includes(decision));
+}
+
 export function buildVibeAcpSpawnInput(
   vibeSettings: VibeAcpRuntimeSettings | null | undefined,
   cwd: string,
@@ -194,13 +220,17 @@ export const readVibeWorkspaceTrust = (
 
 export const trustVibeWorkspace = (
   runtime: Pick<AcpSessionRuntime.AcpSessionRuntime["Service"], "request">,
-  input: { readonly cwd: string; readonly sessionId: string },
+  input: {
+    readonly cwd: string;
+    readonly sessionId: string;
+    readonly decision?: VibeWorkspaceTrustDecision;
+  },
 ): Effect.Effect<WorkspaceTrustStatusResponse, EffectAcpErrors.AcpError> =>
   runtime
     .request("_trust/decision", {
       cwd: input.cwd,
       sessionId: input.sessionId,
-      decision: "trust_cwd",
+      decision: input.decision ?? "trust_cwd",
     })
     .pipe(
       Effect.flatMap((response) =>

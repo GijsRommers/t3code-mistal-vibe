@@ -55,6 +55,7 @@ import {
   makeVibeAcpRuntime,
   readVibeWorkspaceTrust,
   resolveVibeModelId,
+  selectVibeTrustDecision,
   trustVibeWorkspace,
   vibeModeForRuntimeMode,
 } from "../acp/VibeAcpSupport.ts";
@@ -445,20 +446,33 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
           ),
         );
         if (trust.trust_status === "untrusted" && settings.trustWorkspace) {
-          const trusted = yield* trustVibeWorkspace(acp, {
-            cwd,
-            sessionId: started.sessionId,
-          }).pipe(
-            Effect.mapError((cause) =>
-              mapAcpToAdapterError(PROVIDER, input.threadId, "trust/decision", cause),
-            ),
-          );
-          if (trusted.trust_status === "untrusted") {
-            return yield* new ProviderAdapterValidationError({
-              provider: PROVIDER,
-              operation: "startSession",
-              issue: "Vibe declined to trust this workspace.",
+          const decision = selectVibeTrustDecision(trust);
+          if (decision === undefined) {
+            // Vibe has no trust prompt outstanding, so there is nothing to
+            // answer — sending one anyway is rejected with `-32602 No workspace
+            // trust decision is available` and would take the whole session
+            // down. Start untrusted instead and let Vibe gate what it needs to.
+            yield* Effect.logWarning("Mistral Vibe workspace is untrusted and cannot be granted.", {
+              threadId: input.threadId,
+              cwd,
             });
+          } else {
+            const trusted = yield* trustVibeWorkspace(acp, {
+              cwd,
+              sessionId: started.sessionId,
+              decision,
+            }).pipe(
+              Effect.mapError((cause) =>
+                mapAcpToAdapterError(PROVIDER, input.threadId, "trust/decision", cause),
+              ),
+            );
+            if (trusted.trust_status === "untrusted") {
+              return yield* new ProviderAdapterValidationError({
+                provider: PROVIDER,
+                operation: "startSession",
+                issue: "Vibe declined to trust this workspace.",
+              });
+            }
           }
         }
 
