@@ -71,7 +71,7 @@ export function buildVibeEnvironment(
     ...environment,
     VIBE_PROVIDERS: JSON.stringify([
       {
-        name: "t3-ollama",
+        name: "local",
         api_base: apiBase,
         api_style: "openai",
         backend: "generic",
@@ -81,7 +81,7 @@ export function buildVibeEnvironment(
     VIBE_MODELS: JSON.stringify([
       {
         name: model,
-        provider: "t3-ollama",
+        provider: "local",
         alias: "local",
         input_price: 0,
         output_price: 0,

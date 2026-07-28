@@ -36,7 +36,7 @@ describe("VibeAcpSupport", () => {
     expect(environment?.KEEP_ME).toBe("yes");
     expect(JSON.parse(environment?.VIBE_PROVIDERS ?? "[]")).toEqual([
       {
-        name: "t3-ollama",
+        name: "local",
         api_base: "http://127.0.0.1:11434/v1",
         api_style: "openai",
         backend: "generic",
@@ -46,7 +46,7 @@ describe("VibeAcpSupport", () => {
     expect(JSON.parse(environment?.VIBE_MODELS ?? "[]")).toEqual([
       {
         name: "devstral-small-2",
-        provider: "t3-ollama",
+        provider: "local",
         alias: "local",
         input_price: 0,
         output_price: 0,

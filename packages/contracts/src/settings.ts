@@ -359,27 +359,29 @@ export const VibeSettings = makeProviderSettingsSchema(
       }),
     ),
     trustWorkspace: Schema.Boolean.pipe(
-      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.withDecodingDefault(Effect.succeed(true)),
       Schema.annotateKey({
         title: "Trust workspaces",
         description:
-          "Allow Vibe to load repository instructions such as AGENTS.md. Trust is persisted by Vibe for each workspace.",
+          "Automatically trust projects opened in T3 Code so Vibe can load repository instructions such as AGENTS.md. Trust is persisted by Vibe for each workspace.",
         providerSettingsForm: { control: "switch" },
       }),
     ),
     ollamaEnabled: Schema.Boolean.pipe(
       Schema.withDecodingDefault(Effect.succeed(false)),
       Schema.annotateKey({
-        title: "Use Ollama for Local",
-        description: "Point Vibe's Local model option at an Ollama OpenAI-compatible endpoint.",
+        title: "Use a local model",
+        description:
+          "Point Vibe's Local model option at an OpenAI-compatible server such as vLLM, Ollama, LM Studio, or llama.cpp.",
         providerSettingsForm: { control: "switch" },
       }),
     ),
     ollamaBaseUrl: TrimmedString.pipe(
       Schema.withDecodingDefault(Effect.succeed("http://127.0.0.1:11434/v1")),
       Schema.annotateKey({
-        title: "Ollama API URL",
-        description: "OpenAI-compatible Ollama endpoint. Usually ends in /v1.",
+        title: "Local API URL",
+        description:
+          "OpenAI-compatible endpoint. Vibe commonly uses port 8080; Ollama normally uses port 11434.",
         providerSettingsForm: {
           placeholder: "http://127.0.0.1:11434/v1",
           clearWhenEmpty: "omit",
@@ -389,9 +391,9 @@ export const VibeSettings = makeProviderSettingsSchema(
     ollamaModel: TrimmedString.pipe(
       Schema.withDecodingDefault(Effect.succeed("devstral-small-2")),
       Schema.annotateKey({
-        title: "Ollama model",
+        title: "Local model ID",
         description:
-          "Installed Ollama model used by Vibe's Local option, for example devstral-small-2 or devstral-2.",
+          "Model ID exposed by your server, for example mistralai/Devstral-Small-2-24B-Instruct-2512 or an Ollama model name.",
         providerSettingsForm: {
           placeholder: "devstral-small-2",
           clearWhenEmpty: "omit",
