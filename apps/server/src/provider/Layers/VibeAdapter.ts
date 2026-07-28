@@ -744,18 +744,19 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
             ctx.interruptPreparationRequested = true;
           }
         });
-        const shouldCancelAcp = yield* withThreadLock(
+        const acpCancel = yield* withThreadLock(
           threadId,
           Effect.gen(function* () {
             const ctx = yield* requireSession(threadId);
             const activeTurnId = ctx.activeTurnId;
-            if (turnId && activeTurnId && turnId !== activeTurnId) return false;
+            if (turnId && activeTurnId && turnId !== activeTurnId)
+              return Option.none<Effect.Effect<void, never>>();
             yield* Effect.forEach(
               ctx.pendingApprovals.values(),
               (pending) => Deferred.succeed(pending.decision, "cancel").pipe(Effect.ignore),
               { discard: true },
             );
-            if (!activeTurnId) return false;
+            if (!activeTurnId) return Option.none<Effect.Effect<void, never>>();
             const promptStarted =
               ctx.promptStartedSignal !== undefined &&
               (yield* Deferred.isDone(ctx.promptStartedSignal));
@@ -764,17 +765,15 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
                 state: "cancelled",
                 stopReason: "cancelled",
               });
-              return false;
+              return Option.none<Effect.Effect<void, never>>();
             }
-            return true;
+            return Option.some(ctx.acp.cancel.pipe(Effect.ignore));
           }),
         );
-        if (shouldCancelAcp) {
-          const ctx = sessions.get(threadId);
-          if (ctx && !ctx.stopped) {
-            yield* ctx.acp.cancel.pipe(Effect.ignore);
-          }
-        }
+        yield* Option.match(acpCancel, {
+          onNone: () => Effect.void,
+          onSome: (cancelEffect) => cancelEffect,
+        });
       });
 
     const respondToRequest: VibeAdapterShape["respondToRequest"] = (
