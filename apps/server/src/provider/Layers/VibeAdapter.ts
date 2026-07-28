@@ -96,7 +96,9 @@ export function drainVibeEventsUnlessStopped(
   drainEvents: Effect.Effect<void>,
   stoppedSignal: Deferred.Deferred<void>,
 ): Effect.Effect<void> {
-  return Effect.raceFirst(drainEvents, Deferred.await(stoppedSignal));
+  return Effect.raceFirst(drainEvents, Deferred.await(stoppedSignal)).pipe(
+    Effect.catchCause(() => Effect.void),
+  );
 }
 
 function selectPermissionOptionId(

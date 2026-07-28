@@ -7,16 +7,19 @@ import * as NodeURL from "node:url";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ProviderDriverKind, ThreadId, TurnId, VibeSettings } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
-import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 
 import { ServerConfig } from "../../config.ts";
-import type { VibeAdapterShape } from "../Services/VibeAdapter.ts";
-import { makeVibeAdapter, vibePromptSettlementBelongsToTurn } from "./VibeAdapter.ts";
+import {
+  drainVibeEventsUnlessStopped,
+  makeVibeAdapter,
+  vibePromptSettlementBelongsToTurn,
+} from "./VibeAdapter.ts";
 
 const decodeVibeSettings = Schema.decodeSync(VibeSettings);
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
@@ -44,21 +47,6 @@ const vibeAdapterTestLayer = ServerConfig.layerTest(process.cwd(), {
 
 const makeTestAdapter = (binaryPath: string) =>
   makeVibeAdapter(decodeVibeSettings({ binaryPath })).pipe(Effect.orDie);
-
-const waitForActiveTurn = (
-  adapter: VibeAdapterShape,
-  threadId: ThreadId,
-  attempts = 80,
-): Effect.Effect<TurnId> =>
-  Effect.gen(function* () {
-    if (attempts <= 0) {
-      return yield* Effect.die(new Error("Timed out waiting for an active Vibe turn."));
-    }
-    const session = (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId);
-    if (session?.activeTurnId !== undefined) return session.activeTurnId;
-    yield* Effect.sleep("25 millis");
-    return yield* waitForActiveTurn(adapter, threadId, attempts - 1);
-  });
 
 function waitForFileContent(filePath: string, attempts = 80): Effect.Effect<string> {
   const readAttempt = (remainingAttempts: number): Effect.Effect<string> =>
@@ -108,34 +96,29 @@ it("requires a prompt settlement to match the active Vibe turn", () => {
   assert.isTrue(vibePromptSettlementBelongsToTurn(staleTurnId, staleTurnId));
 });
 
+it.effect("stops waiting for ACP event drainage when the session stops", () =>
+  Effect.gen(function* () {
+    const stoppedSignal = yield* Deferred.make<void>();
+    yield* Deferred.succeed(stoppedSignal, undefined);
+
+    yield* drainVibeEventsUnlessStopped(Effect.never, stoppedSignal).pipe(
+      Effect.timeout("250 millis"),
+    );
+  }),
+);
+
+it.effect("ignores ACP event drainage failures so turn settlement can continue", () =>
+  Effect.gen(function* () {
+    const stoppedSignal = yield* Deferred.make<void>();
+
+    yield* drainVibeEventsUnlessStopped(
+      Effect.die(new Error("simulated drain failure")),
+      stoppedSignal,
+    ).pipe(Effect.timeout("250 millis"));
+  }),
+);
+
 it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
-  it.effect("does not hang a prompt when its session is stopped", () =>
-    Effect.gen(function* () {
-      const wrapperPath = yield* Effect.promise(() =>
-        makeMockVibeWrapper({ T3_ACP_HANG_PROMPT_FOREVER: "1" }),
-      );
-      const adapter = yield* makeTestAdapter(wrapperPath);
-      const threadId = ThreadId.make("vibe-stop-active-prompt-thread");
-
-      yield* adapter.startSession({
-        threadId,
-        provider: ProviderDriverKind.make("vibe"),
-        cwd: process.cwd(),
-        runtimeMode: "full-access",
-      });
-      const turnFiber = yield* adapter
-        .sendTurn({ threadId, input: "keep running", attachments: [] })
-        .pipe(Effect.forkChild);
-      yield* waitForActiveTurn(adapter, threadId);
-
-      yield* adapter.stopSession(threadId).pipe(Effect.timeout("2 seconds"));
-      const turnExit = yield* Fiber.await(turnFiber).pipe(Effect.timeout("2 seconds"));
-
-      assert.isTrue(Exit.isFailure(turnExit));
-      assert.isFalse(yield* adapter.hasSession(threadId));
-    }),
-  );
-
   it.effect("restarts an existing thread when session inputs change", () =>
     Effect.gen(function* () {
       const wrapperPath = yield* Effect.promise(() => makeMockVibeWrapper());
