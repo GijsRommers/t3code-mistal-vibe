@@ -752,7 +752,11 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
               });
             }
             if (turn.interrupted) {
-              turn.promptsInFlight = 0;
+              // Release only this prompt's reservation (the `tapCause` below).
+              // Zeroing the whole turn would make a steer-superseded sibling
+              // prompt that is still live on the wire look idle, so the next
+              // sendTurn would open a second turn id and a targeted stop for
+              // this one would no-op.
               return yield* new ProviderAdapterRequestError({
                 provider: PROVIDER,
                 method: "session/prompt",
@@ -778,13 +782,7 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
               turn.started = true;
             }
             return { ctx, turn, prompt };
-          }).pipe(
-            Effect.tapCause(() =>
-              turn.interrupted && turn.promptsInFlight === 0
-                ? Effect.void
-                : settlePromptInFlight(ctx, turn),
-            ),
-          );
+          }).pipe(Effect.tapCause(() => settlePromptInFlight(ctx, turn)));
         }),
       );
 
@@ -867,17 +865,18 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
           const ctx = sessions.get(threadId);
           if (!ctx || ctx.stopped) return;
           const activeTurn = ctx.activeTurn;
-          if (turnId && activeTurn && turnId !== activeTurn.id) return;
-          if (activeTurn) {
-            activeTurn.interrupted = true;
-          }
+          if (!activeTurn || (turnId && turnId !== activeTurn.id)) return;
+          activeTurn.interrupted = true;
         });
         const acpCancel = yield* withThreadLock(
           threadId,
           Effect.gen(function* () {
             const ctx = yield* requireSession(threadId);
             const activeTurn = ctx.activeTurn;
-            if (turnId && activeTurn && turnId !== activeTurn.id) {
+            // A stop targeted at a specific turn must not outlive it: once that
+            // turn is gone the cancel below would land on whatever prompt the
+            // next sendTurn started after this lock was released.
+            if (turnId && turnId !== activeTurn?.id) {
               return Option.none<Effect.Effect<void>>();
             }
             yield* Effect.forEach(
