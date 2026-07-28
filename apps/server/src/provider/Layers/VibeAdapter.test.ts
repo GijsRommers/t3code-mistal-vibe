@@ -326,10 +326,14 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
       );
       yield* adapter.interruptTurn(threadId);
 
-      const result = yield* Fiber.join(sendFiber);
+      const error = yield* Fiber.join(sendFiber).pipe(Effect.flip);
       yield* Effect.yieldNow;
 
-      const requests = yield* waitForFileContent(requestLogPath);
+      const requests = yield* waitForFileOccurrences(
+        requestLogPath,
+        '"method":"session/cancel"',
+        1,
+      );
       const started = events.filter(
         (event) => event.type === "turn.started" && event.threadId === threadId,
       );
@@ -337,19 +341,23 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
         (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
           event.type === "turn.completed" && event.threadId === threadId,
       );
-      assert.lengthOf(started, 1);
-      assert.deepEqual(
-        completed.map((event) => [event.turnId, event.payload.state]),
-        [[result.turnId, "cancelled"]],
-      );
+      assert.equal(error._tag, "ProviderAdapterRequestError");
+      if (error._tag === "ProviderAdapterRequestError") {
+        assert.equal(error.method, "session/prompt");
+        assert.equal(error.detail, "Mistral Vibe prompt was interrupted during preparation.");
+      }
+      assert.lengthOf(started, 0);
+      assert.lengthOf(completed, 1);
+      assert.equal(completed[0]?.payload.state, "cancelled");
       assert.notInclude(requests, '"method":"session/prompt"');
+      assert.include(requests, '"method":"session/cancel"');
 
       yield* Fiber.interrupt(eventsFiber);
       yield* adapter.stopSession(threadId);
     }).pipe(Effect.scoped, Effect.timeout("5 seconds"), TestClock.withLive),
   );
 
-  it.effect("keeps a cancelled prompt as the active turn until Vibe settles it", () =>
+  it.effect("settles a cancelled prompt once and permits a follow-up turn", () =>
     Effect.gen(function* () {
       const tempDir = yield* Effect.promise(() =>
         NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "vibe-in-flight-cancel-")),
@@ -414,10 +422,131 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
           [followUp.turnId, "completed"],
         ],
       );
-      assert.equal(lateDelta?.turnId, firstTurnId);
-      assert.notEqual(lateDelta?.turnId, followUp.turnId);
+      assert.isUndefined(lateDelta);
 
       yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.scoped, Effect.timeout("6 seconds"), TestClock.withLive),
+  );
+
+  it.effect("cancels a running prompt while a steering prompt waits to start", () =>
+    Effect.gen(function* () {
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "vibe-steering-cancel-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockVibeWrapper({
+          T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL: "1",
+          T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+          T3_ACP_SET_CONFIG_OPTION_DELAY_MS: "100",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const threadId = ThreadId.make("vibe-steering-cancel");
+      const firstSendSettled = yield* Deferred.make<void>();
+      const events: ProviderRuntimeEvent[] = [];
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          events.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("vibe"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const requestsAfterStart = yield* waitForFileContent(requestLogPath);
+      const initialConfigRequestCount =
+        requestsAfterStart.split('"method":"session/set_config_option"').length - 1;
+
+      const firstSendFiber = yield* adapter
+        .sendTurn({ threadId, input: "keep running", attachments: [] })
+        .pipe(
+          Effect.ensuring(Deferred.succeed(firstSendSettled, undefined).pipe(Effect.ignore)),
+          Effect.forkChild,
+        );
+      yield* waitForFileOccurrences(requestLogPath, '"method":"session/prompt"', 1);
+
+      const steeringSendFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "steer the running turn",
+          attachments: [],
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("vibe"),
+            model: "mistral-medium-3.5",
+            options: [{ id: "thinking", value: "low" }],
+          },
+        })
+        .pipe(Effect.forkChild);
+      yield* waitForFileOccurrences(
+        requestLogPath,
+        '"method":"session/set_config_option"',
+        initialConfigRequestCount + 1,
+      );
+      yield* Effect.sleep("150 millis");
+      assert.isFalse(yield* Deferred.isDone(firstSendSettled));
+
+      const interruptFiber = yield* adapter.interruptTurn(threadId).pipe(Effect.forkChild);
+      yield* waitForFileOccurrences(requestLogPath, '"method":"session/cancel"', 1, 20);
+      assert.isFalse(yield* Deferred.isDone(firstSendSettled));
+
+      yield* Fiber.join(interruptFiber);
+      yield* Fiber.join(firstSendFiber);
+      yield* Fiber.join(steeringSendFiber);
+      const completed = events.filter(
+        (event): event is Extract<ProviderRuntimeEvent, { type: "turn.completed" }> =>
+          event.type === "turn.completed" && event.threadId === threadId,
+      );
+      assert.lengthOf(completed, 1);
+      assert.equal(completed[0]?.payload.state, "cancelled");
+
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.scoped, Effect.timeout("5 seconds"), TestClock.withLive),
+  );
+
+  it.effect("releases the active turn when the sendTurn caller is interrupted", () =>
+    Effect.gen(function* () {
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "vibe-caller-interrupt-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockVibeWrapper({
+          T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const threadId = ThreadId.make("vibe-caller-interrupt");
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("vibe"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const sendFiber = yield* adapter
+        .sendTurn({ threadId, input: "abandon me", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* waitForFileOccurrences(requestLogPath, '"method":"session/prompt"', 1);
+      yield* Fiber.interrupt(sendFiber);
+
+      const [abandonedSession] = yield* adapter.listSessions();
+      assert.equal(abandonedSession?.status, "ready");
+      assert.isUndefined(abandonedSession?.activeTurnId);
+
+      const followUp = yield* adapter
+        .sendTurn({ threadId, input: "continue after the caller went away", attachments: [] })
+        .pipe(Effect.timeout("2 seconds"));
+      assert.equal(followUp.threadId, threadId);
+
       yield* adapter.stopSession(threadId);
     }).pipe(Effect.scoped, Effect.timeout("6 seconds"), TestClock.withLive),
   );

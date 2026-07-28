@@ -88,6 +88,7 @@ export const VibeDriver: ProviderDriver<VibeSettings, VibeDriverEnv> = {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettingsService;
+      const eventLoggers = yield* ProviderEventLoggers;
       const processEnv = mergeProviderInstanceEnvironment(environment);
       const continuationIdentity = defaultProviderContinuationIdentity({
         driverKind: DRIVER_KIND,
@@ -106,6 +107,7 @@ export const VibeDriver: ProviderDriver<VibeSettings, VibeDriverEnv> = {
       });
       const adapter = yield* makeVibeAdapter(effectiveConfig, {
         environment: processEnv,
+        ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
         instanceId,
       });
       const textGeneration = yield* makeVibeTextGeneration(effectiveConfig, processEnv);
