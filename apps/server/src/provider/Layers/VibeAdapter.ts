@@ -74,6 +74,7 @@ interface VibeSessionContext {
   readonly scope: Scope.Closeable;
   readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
+  readonly stoppedSignal: Deferred.Deferred<void>;
   session: ProviderSession;
   turns: Array<{ id: TurnId; items: Array<unknown> }>;
   notificationFiber?: Fiber.Fiber<void, never>;
@@ -162,12 +163,12 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
       Effect.gen(function* () {
         if (ctx.stopped) return;
         ctx.stopped = true;
+        yield* Deferred.succeed(ctx.stoppedSignal, undefined).pipe(Effect.ignore);
         yield* Effect.forEach(
           ctx.pendingApprovals.values(),
           (pending) => Deferred.succeed(pending.decision, "cancel").pipe(Effect.ignore),
           { discard: true },
         );
-        if (ctx.notificationFiber) yield* Fiber.interrupt(ctx.notificationFiber);
         yield* Scope.close(ctx.scope, Exit.void).pipe(Effect.ignore);
         sessions.delete(ctx.threadId);
         yield* publish({
@@ -211,6 +212,7 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
               }).pipe(Effect.andThen(Scope.close(sessionScope, Exit.void).pipe(Effect.ignore))),
         );
         const pendingApprovals = new Map<ApprovalRequestId, PendingApproval>();
+        const stoppedSignal = yield* Deferred.make<void>();
         const resumedSessionId = resumeSessionId(input.resumeCursor);
         const modelSelection =
           input.modelSelection?.instanceId === instanceId ? input.modelSelection : undefined;
@@ -368,6 +370,7 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
           scope: sessionScope,
           acp,
           pendingApprovals,
+          stoppedSignal,
           session,
           turns: [],
           stopped: false,
@@ -556,8 +559,10 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
         const result = yield* ctx.acp.prompt({ prompt }).pipe(
           Effect.tapError((cause) =>
             Effect.gen(function* () {
-              yield* ctx.acp.drainEvents;
-              if (!vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId)) return;
+              yield* Effect.raceFirst(ctx.acp.drainEvents, Deferred.await(ctx.stoppedSignal));
+              if (ctx.stopped || !vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId)) {
+                return;
+              }
               delete ctx.activeTurnId;
               const { activeTurnId: _activeTurnId, ...ready } = ctx.session;
               ctx.session = {
@@ -582,9 +587,9 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
             mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", cause),
           ),
         );
-        yield* ctx.acp.drainEvents;
+        yield* Effect.raceFirst(ctx.acp.drainEvents, Deferred.await(ctx.stoppedSignal));
         ctx.turns.push({ id: turnId, items: [{ prompt, result }] });
-        if (!vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId)) {
+        if (ctx.stopped || !vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId)) {
           return { threadId: input.threadId, turnId, resumeCursor: ctx.session.resumeCursor };
         }
         const updatedAt = yield* nowIso;
