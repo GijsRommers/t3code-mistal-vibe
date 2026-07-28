@@ -21,6 +21,7 @@ const emitAskQuestion = process.env.T3_ACP_EMIT_ASK_QUESTION === "1";
 const emitXAiAskUserQuestion = process.env.T3_ACP_EMIT_XAI_ASK_USER_QUESTION === "1";
 const emitXAiPromptCompleteThenHang = process.env.T3_ACP_EMIT_XAI_PROMPT_COMPLETE_THEN_HANG === "1";
 const emitForeignSessionUpdates = process.env.T3_ACP_EMIT_FOREIGN_SESSION_UPDATES === "1";
+const useVibeConfig = process.env.T3_ACP_VIBE_CONFIG === "1";
 const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
 const hangFirstPromptForever = process.env.T3_ACP_HANG_FIRST_PROMPT_FOREVER === "1";
 const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL === "1";
@@ -47,8 +48,8 @@ const permissionOptionIds = {
 };
 const sessionId = "mock-session-1";
 
-let currentModeId = "ask";
-let currentModelId = "default";
+let currentModeId = useVibeConfig ? "default" : "ask";
+let currentModelId = useVibeConfig ? "mistral-medium-3.5" : "default";
 let parameterizedModelPicker = false;
 let currentReasoning = "medium";
 let currentContext = "272k";
@@ -94,6 +95,47 @@ process.once("exit", (code) => {
 });
 
 function configOptions(): ReadonlyArray<AcpSchema.SessionConfigOption> {
+  if (useVibeConfig) {
+    return [
+      {
+        id: "mode",
+        name: "Mode",
+        category: "mode",
+        type: "select",
+        currentValue: currentModeId,
+        options: availableModes.map((mode) => ({
+          value: mode.id,
+          name: mode.name,
+          ...(mode.description ? { description: mode.description } : {}),
+        })),
+      },
+      {
+        id: "model",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: currentModelId,
+        options: [
+          { value: "mistral-medium-3.5", name: "Mistral Medium 3.5" },
+          { value: "devstral-small", name: "Devstral Small" },
+          { value: "local", name: "Local" },
+        ],
+      },
+      {
+        id: "thinking",
+        name: "Thinking",
+        category: "model_config",
+        type: "select",
+        currentValue: "high",
+        options: [
+          { value: "off", name: "Off" },
+          { value: "low", name: "Low" },
+          { value: "high", name: "High" },
+        ],
+      },
+    ];
+  }
+
   if (parameterizedModelPicker) {
     const baseOptions: Array<AcpSchema.SessionConfigOption> = [
       {
@@ -253,23 +295,30 @@ function availableModels(): ReadonlyArray<{
   }));
 }
 
-const availableModes: ReadonlyArray<AcpSchema.SessionMode> = [
-  {
-    id: "ask",
-    name: "Ask",
-    description: "Request permission before making any changes",
-  },
-  {
-    id: "architect",
-    name: "Architect",
-    description: "Design and plan software systems without implementation",
-  },
-  {
-    id: "code",
-    name: "Code",
-    description: "Write and modify code with full tool access",
-  },
-];
+const availableModes: ReadonlyArray<AcpSchema.SessionMode> = useVibeConfig
+  ? [
+      { id: "default", name: "Default" },
+      { id: "accept-edits", name: "Accept edits" },
+      { id: "auto-approve", name: "Auto approve" },
+      { id: "plan", name: "Plan" },
+    ]
+  : [
+      {
+        id: "ask",
+        name: "Ask",
+        description: "Request permission before making any changes",
+      },
+      {
+        id: "architect",
+        name: "Architect",
+        description: "Design and plan software systems without implementation",
+      },
+      {
+        id: "code",
+        name: "Code",
+        description: "Write and modify code with full tool access",
+      },
+    ];
 
 function modeState(): AcpSchema.SessionModeState {
   return {
@@ -282,14 +331,20 @@ const grokAcpModels: ReadonlyArray<AcpSchema.ModelInfo> = [
   { modelId: "grok-build", name: "Grok Build" },
   { modelId: "grok-mock-alt", name: "Grok Mock Alt" },
 ];
+const vibeAcpModels: ReadonlyArray<AcpSchema.ModelInfo> = [
+  { modelId: "mistral-medium-3.5", name: "Mistral Medium 3.5" },
+  { modelId: "devstral-small", name: "Devstral Small" },
+  { modelId: "local", name: "Local" },
+];
 
 function modelState(): AcpSchema.SessionModelState {
-  const modelId = grokAcpModels.some((model) => model.modelId === currentModelId)
+  const availableModels = useVibeConfig ? vibeAcpModels : grokAcpModels;
+  const modelId = availableModels.some((model) => model.modelId === currentModelId)
     ? currentModelId
-    : "grok-build";
+    : availableModels[0]!.modelId;
   return {
     currentModelId: modelId,
-    availableModels: grokAcpModels,
+    availableModels,
   };
 }
 
@@ -382,7 +437,8 @@ const program = Effect.gen(function* () {
 
   yield* agent.handleSetSessionModel((request) =>
     Effect.gen(function* () {
-      if (!grokAcpModels.some((model) => model.modelId === request.modelId)) {
+      const availableModels = useVibeConfig ? vibeAcpModels : grokAcpModels;
+      if (!availableModels.some((model) => model.modelId === request.modelId)) {
         return yield* AcpError.AcpRequestError.invalidParams(
           `Unknown mock model id: ${request.modelId}`,
           {
@@ -878,6 +934,10 @@ const program = Effect.gen(function* () {
   );
 
   yield* agent.handleUnknownExtRequest((method, params) => {
+    if (method === "_trust/status" || method === "_trust/decision") {
+      return Effect.succeed({ trust_status: "trusted", details: null });
+    }
+
     if (method === "cursor/list_available_models") {
       return Effect.succeed({
         models: availableModels(),

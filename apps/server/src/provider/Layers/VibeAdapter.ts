@@ -81,6 +81,13 @@ interface VibeSessionContext {
   stopped: boolean;
 }
 
+export function vibePromptSettlementBelongsToTurn(
+  activeTurnId: TurnId | undefined,
+  turnId: TurnId,
+): boolean {
+  return activeTurnId === turnId;
+}
+
 function selectPermissionOptionId(
   request: EffectAcpSchema.RequestPermissionRequest,
   decision: Exclude<ProviderApprovalDecision, "cancel">,
@@ -189,7 +196,9 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
           });
         }
         const existing = sessions.get(input.threadId);
-        if (existing && !existing.stopped) return existing.session;
+        if (existing && !existing.stopped) {
+          yield* stopContext(existing);
+        }
 
         const cwd = path.resolve(input.cwd);
         const sessionScope = yield* Scope.make();
@@ -548,7 +557,7 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
           Effect.tapError((cause) =>
             Effect.gen(function* () {
               yield* ctx.acp.drainEvents;
-              if (ctx.activeTurnId !== turnId) return;
+              if (!vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId)) return;
               delete ctx.activeTurnId;
               const { activeTurnId: _activeTurnId, ...ready } = ctx.session;
               ctx.session = {
@@ -575,6 +584,9 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
         );
         yield* ctx.acp.drainEvents;
         ctx.turns.push({ id: turnId, items: [{ prompt, result }] });
+        if (!vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId)) {
+          return { threadId: input.threadId, turnId, resumeCursor: ctx.session.resumeCursor };
+        }
         const updatedAt = yield* nowIso;
         delete ctx.activeTurnId;
         const { activeTurnId: _activeTurnId, ...ready } = ctx.session;
@@ -674,6 +686,12 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
       Effect.succeed(sessions.has(threadId));
     const stopAll: VibeAdapterShape["stopAll"] = () =>
       Effect.forEach(Array.from(sessions.values()), stopContext, { discard: true });
+
+    yield* Effect.addFinalizer(() =>
+      Effect.forEach(Array.from(sessions.values()), stopContext, { discard: true }).pipe(
+        Effect.ignore,
+      ),
+    );
 
     return {
       provider: PROVIDER,

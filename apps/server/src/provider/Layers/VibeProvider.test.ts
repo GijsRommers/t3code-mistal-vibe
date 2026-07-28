@@ -1,7 +1,19 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { describe, expect, it } from "@effect/vitest";
 import { createModelCapabilities } from "@t3tools/shared/model";
-import { describe, expect, it } from "vite-plus/test";
+import { VibeSettings } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 
-import { buildVibeCapabilities, buildVibeModelsFromConfigOptions } from "./VibeProvider.ts";
+import {
+  buildVibeCapabilities,
+  buildVibeModelsFromConfigOptions,
+  checkVibeProviderStatus,
+} from "./VibeProvider.ts";
+
+const decodeVibeSettings = Schema.decodeSync(VibeSettings);
 
 const configOptions = [
   {
@@ -63,4 +75,34 @@ describe("VibeProvider", () => {
       }),
     );
   });
+});
+
+it.layer(NodeServices.layer)("checkVibeProviderStatus", (it) => {
+  it.effect("does not claim authentication failed when ACP discovery fails", () =>
+    Effect.gen(function* () {
+      const snapshot = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const dir = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-vibe-discovery-" });
+          const vibePath = path.join(dir, "vibe-acp");
+          yield* fs.writeFileString(
+            vibePath,
+            ["#!/bin/sh", 'printf "vibe 0.0.99\\n"', "exit 0", ""].join("\n"),
+          );
+          yield* fs.chmod(vibePath, 0o755);
+
+          return yield* checkVibeProviderStatus(
+            decodeVibeSettings({ enabled: true, binaryPath: vibePath }),
+          );
+        }),
+      );
+
+      expect(snapshot.installed).toBe(true);
+      expect(snapshot.status).toBe("warning");
+      expect(snapshot.auth.status).toBe("unknown");
+      expect(snapshot.message).toContain("ACP discovery failed");
+      expect(snapshot.message).not.toContain("vibe --setup");
+    }),
+  );
 });

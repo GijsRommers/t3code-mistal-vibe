@@ -276,9 +276,9 @@ export const checkVibeProviderStatus = Effect.fn("checkVibeProviderStatus")(func
         installed: true,
         version,
         status: "warning",
-        auth: { status: "unauthenticated" },
+        auth: { status: "unknown" },
         message:
-          "Mistral Vibe is installed but ACP could not open a session. Run `vibe --setup` to authenticate, then refresh.",
+          "Mistral Vibe is installed but ACP discovery failed. Check the Vibe configuration and server logs, then refresh.",
       },
     });
   }
