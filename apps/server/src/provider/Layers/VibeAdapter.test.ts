@@ -25,11 +25,7 @@ import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
 import { ServerConfig } from "../../config.ts";
-import {
-  drainVibeEventsUnlessStopped,
-  makeVibeAdapter,
-  vibePromptSettlementBelongsToTurn,
-} from "./VibeAdapter.ts";
+import { drainVibeEventsUnlessStopped, makeVibeAdapter } from "./VibeAdapter.ts";
 
 const decodeVibeSettings = Schema.decodeSync(VibeSettings);
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
@@ -96,15 +92,6 @@ function waitForFileOccurrences(
     });
   return readAttempt(attempts);
 }
-
-it("requires a prompt settlement to match the active Vibe turn", () => {
-  const staleTurnId = TurnId.make("stale-turn");
-  const replacementTurnId = TurnId.make("replacement-turn");
-
-  assert.isFalse(vibePromptSettlementBelongsToTurn(undefined, staleTurnId));
-  assert.isFalse(vibePromptSettlementBelongsToTurn(replacementTurnId, staleTurnId));
-  assert.isTrue(vibePromptSettlementBelongsToTurn(staleTurnId, staleTurnId));
-});
 
 it.effect("stops waiting for ACP event drainage when the session stops", () =>
   Effect.gen(function* () {
@@ -255,6 +242,38 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
       yield* Fiber.join(stopFiber);
       assert.isFalse(yield* adapter.hasSession(threadId));
     }).pipe(Effect.scoped, Effect.timeout("4 seconds"), TestClock.withLive),
+  );
+
+  it.effect("releases the reserved turn when prompt preparation fails", () =>
+    Effect.gen(function* () {
+      const wrapperPath = yield* Effect.promise(() => makeMockVibeWrapper());
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const threadId = ThreadId.make("vibe-prompt-preparation-failure");
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("vibe"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const failedTurn = yield* adapter
+        .sendTurn({ threadId, input: " ", attachments: [] })
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(failedTurn));
+      const [readySession] = yield* adapter.listSessions();
+      assert.equal(readySession?.status, "ready");
+      assert.isUndefined(readySession?.activeTurnId);
+
+      const retry = yield* adapter.sendTurn({
+        threadId,
+        input: "continue after preparation failure",
+        attachments: [],
+      });
+      assert.equal(retry.threadId, threadId);
+
+      yield* adapter.stopSession(threadId);
+    }),
   );
 
   it.effect("settles a cancellation queued during turn preparation without prompting Vibe", () =>
@@ -470,6 +489,12 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
         2,
       );
       assert.equal(requests.split('"method":"session/prompt"').length - 1, 2);
+      const thread = yield* adapter.readThread(threadId);
+      assert.lengthOf(thread.turns, 1);
+      assert.lengthOf(thread.turns[0]?.items ?? [], 2);
+      const [session] = yield* adapter.listSessions();
+      assert.equal(session?.status, "ready");
+      assert.isUndefined(session?.activeTurnId);
 
       yield* Fiber.interrupt(eventsFiber);
       yield* adapter.stopSession(threadId);
