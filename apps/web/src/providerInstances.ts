@@ -202,11 +202,12 @@ export function applyProviderInstanceSettings(
 
   return entries.map((entry) => {
     const explicitInstance = settings.providerInstances?.[entry.instanceId];
-    const enabled = explicitInstance
-      ? (explicitInstance.enabled ?? true)
-      : entry.isDefault
-        ? (legacyProviders[entry.driverKind]?.enabled ?? entry.enabled)
-        : false;
+    let enabled = false;
+    if (explicitInstance) {
+      enabled = explicitInstance.enabled ?? true;
+    } else if (entry.isDefault) {
+      enabled = legacyProviders[entry.driverKind]?.enabled ?? entry.enabled;
+    }
     return enabled === entry.enabled ? entry : { ...entry, enabled };
   });
 }
@@ -215,8 +216,8 @@ export function applyProviderInstanceSettings(
  * Sort instance entries so the default instance of each driver kind appears
  * before any custom instances of the same kind. Within a kind, custom
  * instances keep their settings-author order (which is how the server
- * emits them). Stable across kinds: entries retain the server's
- * cross-driver ordering.
+ * emits them). Across kinds, entries retain the server's order except that
+ * Mistral Vibe is kept immediately after OpenCode to match provider settings.
  */
 export function sortProviderInstanceEntries(
   entries: ReadonlyArray<ProviderInstanceEntry>,
@@ -234,8 +235,19 @@ export function sortProviderInstanceEntries(
       byKind.set(entry.driverKind, [entry]);
     }
   }
+  const orderedBuckets = Array.from(byKind.entries());
+  const vibeIndex = orderedBuckets.findIndex(([kind]) => kind === "vibe");
+  const openCodeIndex = orderedBuckets.findIndex(([kind]) => kind === "opencode");
+  if (vibeIndex !== -1 && openCodeIndex !== -1 && vibeIndex !== openCodeIndex + 1) {
+    const [vibeBucket] = orderedBuckets.splice(vibeIndex, 1);
+    if (vibeBucket) {
+      const currentOpenCodeIndex = orderedBuckets.findIndex(([kind]) => kind === "opencode");
+      orderedBuckets.splice(currentOpenCodeIndex + 1, 0, vibeBucket);
+    }
+  }
+
   const sorted: ProviderInstanceEntry[] = [];
-  for (const bucket of byKind.values()) {
+  for (const [, bucket] of orderedBuckets) {
     const defaults = bucket.filter((entry) => entry.isDefault);
     const customs = bucket.filter((entry) => !entry.isDefault);
     sorted.push(...defaults, ...customs);

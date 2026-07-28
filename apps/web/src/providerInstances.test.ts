@@ -9,6 +9,7 @@ import {
   resolveDefaultProviderModelSelection,
   resolveSelectableProviderInstance,
   resolveProviderDriverKindForInstanceSelection,
+  sortProviderInstanceEntries,
 } from "./providerInstances";
 
 function provider(input: {
@@ -129,6 +130,28 @@ describe("deriveProviderInstanceEntries", () => {
     expect(entry?.instanceId).toBe("codex_personal");
     expect(entry?.driverKind).toBe("codex");
     expect(entry?.isDefault).toBe(false);
+  });
+});
+
+describe("sortProviderInstanceEntries", () => {
+  it("places Mistral Vibe immediately after OpenCode while preserving instances within each kind", () => {
+    const entries = deriveProviderInstanceEntries([
+      provider({ provider: ProviderDriverKind.make("claudeAgent"), instanceId: "claudeAgent" }),
+      provider({ provider: ProviderDriverKind.make("vibe"), instanceId: "vibe_personal" }),
+      provider({ provider: ProviderDriverKind.make("vibe"), instanceId: "vibe" }),
+      provider({ provider: ProviderDriverKind.make("grok"), instanceId: "grok" }),
+      provider({ provider: ProviderDriverKind.make("opencode"), instanceId: "opencode_personal" }),
+      provider({ provider: ProviderDriverKind.make("opencode"), instanceId: "opencode" }),
+    ]);
+
+    expect(sortProviderInstanceEntries(entries).map((entry) => entry.instanceId)).toEqual([
+      "claudeAgent",
+      "grok",
+      "opencode",
+      "opencode_personal",
+      "vibe",
+      "vibe_personal",
+    ]);
   });
 });
 
