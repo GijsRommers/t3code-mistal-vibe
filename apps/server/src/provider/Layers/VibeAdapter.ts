@@ -18,10 +18,13 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import * as SynchronizedRef from "effect/SynchronizedRef";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import * as EffectAcpErrors from "effect-acp/errors";
 import type * as EffectAcpSchema from "effect-acp/schema";
@@ -89,6 +92,13 @@ export function vibePromptSettlementBelongsToTurn(
   return activeTurnId === turnId;
 }
 
+export function drainVibeEventsUnlessStopped(
+  drainEvents: Effect.Effect<void>,
+  stoppedSignal: Deferred.Deferred<void>,
+): Effect.Effect<void> {
+  return Effect.raceFirst(drainEvents, Deferred.await(stoppedSignal));
+}
+
 function selectPermissionOptionId(
   request: EffectAcpSchema.RequestPermissionRequest,
   decision: Exclude<ProviderApprovalDecision, "cancel">,
@@ -121,6 +131,7 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
     const serverConfig = yield* ServerConfig;
     const crypto = yield* Crypto.Crypto;
     const sessions = new Map<ThreadId, VibeSessionContext>();
+    const threadLocksRef = yield* SynchronizedRef.make(new Map<string, Semaphore.Semaphore>());
     const events = yield* PubSub.unbounded<ProviderRuntimeEvent>();
 
     const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -148,6 +159,23 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
         ? Effect.fail(new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId }))
         : Effect.succeed(ctx);
     };
+    const getThreadSemaphore = (threadId: string) =>
+      SynchronizedRef.modifyEffect(threadLocksRef, (current) => {
+        const existing = Option.fromNullishOr(current.get(threadId));
+        return Option.match(existing, {
+          onNone: () =>
+            Semaphore.make(1).pipe(
+              Effect.map((semaphore) => {
+                const next = new Map(current);
+                next.set(threadId, semaphore);
+                return [semaphore, next] as const;
+              }),
+            ),
+          onSome: (semaphore) => Effect.succeed([semaphore, current] as const),
+        });
+      });
+    const withThreadLock = <A, E, R>(threadId: string, effect: Effect.Effect<A, E, R>) =>
+      Effect.flatMap(getThreadSemaphore(threadId), (semaphore) => semaphore.withPermit(effect));
     const callbackError = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       effect.pipe(
         Effect.mapError(
@@ -180,7 +208,7 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
         });
       });
 
-    const startSession: VibeAdapterShape["startSession"] = (input) =>
+    const startSessionUnlocked: VibeAdapterShape["startSession"] = (input) =>
       Effect.gen(function* () {
         if (input.provider !== undefined && input.provider !== PROVIDER) {
           return yield* new ProviderAdapterValidationError({
@@ -474,6 +502,9 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
         return session;
       }).pipe(Effect.scoped);
 
+    const startSession: VibeAdapterShape["startSession"] = (input) =>
+      withThreadLock(input.threadId, startSessionUnlocked(input));
+
     const sendTurn: VibeAdapterShape["sendTurn"] = (input) =>
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
@@ -559,7 +590,7 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
         const result = yield* ctx.acp.prompt({ prompt }).pipe(
           Effect.tapError((cause) =>
             Effect.gen(function* () {
-              yield* Effect.raceFirst(ctx.acp.drainEvents, Deferred.await(ctx.stoppedSignal));
+              yield* drainVibeEventsUnlessStopped(ctx.acp.drainEvents, ctx.stoppedSignal);
               if (ctx.stopped || !vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId)) {
                 return;
               }
@@ -587,7 +618,7 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
             mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", cause),
           ),
         );
-        yield* Effect.raceFirst(ctx.acp.drainEvents, Deferred.await(ctx.stoppedSignal));
+        yield* drainVibeEventsUnlessStopped(ctx.acp.drainEvents, ctx.stoppedSignal);
         ctx.turns.push({ id: turnId, items: [{ prompt, result }] });
         if (ctx.stopped || !vibePromptSettlementBelongsToTurn(ctx.activeTurnId, turnId)) {
           return { threadId: input.threadId, turnId, resumeCursor: ctx.session.resumeCursor };

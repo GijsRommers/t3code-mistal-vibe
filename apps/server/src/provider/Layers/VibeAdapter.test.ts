@@ -15,6 +15,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 
 import { ServerConfig } from "../../config.ts";
+import type { VibeAdapterShape } from "../Services/VibeAdapter.ts";
 import { makeVibeAdapter, vibePromptSettlementBelongsToTurn } from "./VibeAdapter.ts";
 
 const decodeVibeSettings = Schema.decodeSync(VibeSettings);
@@ -45,7 +46,7 @@ const makeTestAdapter = (binaryPath: string) =>
   makeVibeAdapter(decodeVibeSettings({ binaryPath })).pipe(Effect.orDie);
 
 const waitForActiveTurn = (
-  adapter: Effect.Effect.Success<ReturnType<typeof makeTestAdapter>>,
+  adapter: VibeAdapterShape,
   threadId: ThreadId,
   attempts = 80,
 ): Effect.Effect<TurnId> =>
@@ -69,6 +70,29 @@ function waitForFileContent(filePath: string, attempts = 80): Effect.Effect<stri
         Effect.orElseSucceed(() => ""),
       );
       if (raw.trim().length > 0) return raw;
+      yield* Effect.sleep("25 millis");
+      return yield* readAttempt(remainingAttempts - 1);
+    });
+  return readAttempt(attempts);
+}
+
+function waitForFileOccurrences(
+  filePath: string,
+  expected: string,
+  count: number,
+  attempts = 80,
+): Effect.Effect<string> {
+  const readAttempt = (remainingAttempts: number): Effect.Effect<string> =>
+    Effect.gen(function* () {
+      if (remainingAttempts <= 0) {
+        return yield* Effect.die(
+          new Error(`Timed out waiting for ${count} '${expected}' entries in ${filePath}`),
+        );
+      }
+      const raw = yield* Effect.tryPromise(() => NodeFSP.readFile(filePath, "utf8")).pipe(
+        Effect.orElseSucceed(() => ""),
+      );
+      if (raw.split(expected).length - 1 >= count) return raw;
       yield* Effect.sleep("25 millis");
       return yield* readAttempt(remainingAttempts - 1);
     });
@@ -142,6 +166,38 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
       assert.equal(restartedSession.cwd, NodePath.resolve(secondCwd));
       assert.equal(restartedSession.runtimeMode, "full-access");
       assert.lengthOf(yield* adapter.listSessions(), 1);
+    }),
+  );
+
+  it.effect("serializes concurrent starts for the same thread", () =>
+    Effect.gen(function* () {
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "vibe-concurrent-start-")),
+      );
+      const exitLogPath = NodePath.join(tempDir, "exit.log");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockVibeWrapper({ T3_ACP_EXIT_LOG_PATH: exitLogPath }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const threadId = ThreadId.make("vibe-concurrent-start-thread");
+      const startInput = {
+        threadId,
+        provider: ProviderDriverKind.make("vibe"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access" as const,
+      };
+
+      const started = yield* Effect.all(
+        [adapter.startSession(startInput), adapter.startSession(startInput)],
+        { concurrency: "unbounded" },
+      );
+
+      assert.lengthOf(started, 2);
+      assert.lengthOf(yield* adapter.listSessions(), 1);
+      assert.include(yield* waitForFileOccurrences(exitLogPath, "SIGTERM", 1), "SIGTERM");
+
+      yield* adapter.stopAll();
+      assert.include(yield* waitForFileOccurrences(exitLogPath, "SIGTERM", 2), "SIGTERM");
     }),
   );
 
