@@ -48,7 +48,15 @@ const decodeWorkspaceTrustStatusResponse = Schema.decodeUnknownEffect(WorkspaceT
 
 export type VibeWorkspaceTrustDecision = "trust_repo" | "trust_cwd" | "trust_session";
 
-/** Broadest grant first: trusting the repo covers later sessions in any subdir. */
+/**
+ * Narrowest durable grant first.
+ *
+ * An automatic grant should never be wider than the workspace the user opened:
+ * `trust_repo` would trust every sibling directory in the repo off the back of
+ * a session in one subdirectory. `trust_cwd` matches what the adapter granted
+ * before this preference existed; `trust_session` is last because it buys
+ * nothing beyond the current session.
+ */
 const TRUST_DECISION_PREFERENCE: ReadonlyArray<VibeWorkspaceTrustDecision> = [
   "trust_cwd",
   "trust_repo",
