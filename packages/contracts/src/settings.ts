@@ -345,6 +345,70 @@ export const GrokSettings = makeProviderSettingsSchema(
 );
 export type GrokSettings = typeof GrokSettings.Type;
 
+export const VibeSettings = makeProviderSettingsSchema(
+  {
+    enabled: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(true)),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+    binaryPath: makeBinaryPathSetting("vibe-acp").pipe(
+      Schema.annotateKey({
+        title: "Binary path",
+        description: "Path to the Mistral Vibe ACP binary.",
+        providerSettingsForm: { placeholder: "vibe-acp", clearWhenEmpty: "omit" },
+      }),
+    ),
+    trustWorkspace: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Trust workspaces",
+        description:
+          "Allow Vibe to load repository instructions such as AGENTS.md. Trust is persisted by Vibe for each workspace.",
+        providerSettingsForm: { control: "switch" },
+      }),
+    ),
+    ollamaEnabled: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Use Ollama for Local",
+        description: "Point Vibe's Local model option at an Ollama OpenAI-compatible endpoint.",
+        providerSettingsForm: { control: "switch" },
+      }),
+    ),
+    ollamaBaseUrl: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("http://127.0.0.1:11434/v1")),
+      Schema.annotateKey({
+        title: "Ollama API URL",
+        description: "OpenAI-compatible Ollama endpoint. Usually ends in /v1.",
+        providerSettingsForm: {
+          placeholder: "http://127.0.0.1:11434/v1",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    ollamaModel: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("devstral-small-2")),
+      Schema.annotateKey({
+        title: "Ollama model",
+        description:
+          "Installed Ollama model used by Vibe's Local option, for example devstral-small-2 or devstral-2.",
+        providerSettingsForm: {
+          placeholder: "devstral-small-2",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    customModels: Schema.Array(Schema.String).pipe(
+      Schema.withDecodingDefault(Effect.succeed([])),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+  },
+  {
+    order: ["binaryPath", "trustWorkspace", "ollamaEnabled", "ollamaBaseUrl", "ollamaModel"],
+  },
+);
+export type VibeSettings = typeof VibeSettings.Type;
+
 export const OpenCodeSettings = makeProviderSettingsSchema(
   {
     enabled: Schema.Boolean.pipe(
@@ -462,6 +526,7 @@ export const ServerSettings = Schema.Struct({
     claudeAgent: ClaudeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     cursor: CursorSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     grok: GrokSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+    vibe: VibeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     opencode: OpenCodeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   }).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   // New driver-agnostic instance map. Keyed by `ProviderInstanceId`; values
@@ -558,6 +623,16 @@ const GrokSettingsPatch = Schema.Struct({
   customModels: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 
+const VibeSettingsPatch = Schema.Struct({
+  enabled: Schema.optionalKey(Schema.Boolean),
+  binaryPath: Schema.optionalKey(TrimmedString),
+  trustWorkspace: Schema.optionalKey(Schema.Boolean),
+  ollamaEnabled: Schema.optionalKey(Schema.Boolean),
+  ollamaBaseUrl: Schema.optionalKey(TrimmedString),
+  ollamaModel: Schema.optionalKey(TrimmedString),
+  customModels: Schema.optionalKey(Schema.Array(Schema.String)),
+});
+
 const OpenCodeSettingsPatch = Schema.Struct({
   enabled: Schema.optionalKey(Schema.Boolean),
   binaryPath: Schema.optionalKey(TrimmedString),
@@ -595,6 +670,7 @@ export const ServerSettingsPatch = Schema.Struct({
       claudeAgent: Schema.optionalKey(ClaudeSettingsPatch),
       cursor: Schema.optionalKey(CursorSettingsPatch),
       grok: Schema.optionalKey(GrokSettingsPatch),
+      vibe: Schema.optionalKey(VibeSettingsPatch),
       opencode: Schema.optionalKey(OpenCodeSettingsPatch),
     }),
   ),

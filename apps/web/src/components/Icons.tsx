@@ -211,6 +211,17 @@ export const GrokIcon: Icon = ({ className, ...props }) => (
   </svg>
 );
 
+export const MistralIcon: Icon = ({ className, ...props }) => (
+  <svg
+    {...props}
+    viewBox="0 0 24 24"
+    className={cn("fill-[#FF7000]", className)}
+    aria-hidden="true"
+  >
+    <path d="M3 3h4v4H3V3Zm14 0h4v4h-4V3ZM3 7h8v4H3V7Zm10 0h8v4h-8V7ZM3 11h18v10h-4v-6h-3v4h-4v-4H7v6H3V11Z" />
+  </svg>
+);
+
 export const TraeIcon: Icon = (props) => (
   <svg {...props} viewBox="0 0 24 24" fill="currentColor">
     {/* Back rectangle: left strip + bottom strip drawn separately — empty bottom-left corner is the gap between them */}
