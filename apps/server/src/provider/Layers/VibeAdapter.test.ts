@@ -346,11 +346,16 @@ it.layer(vibeAdapterTestLayer)("VibeAdapter", (it) => {
         assert.equal(error.method, "session/prompt");
         assert.equal(error.detail, "Mistral Vibe prompt was interrupted during preparation.");
       }
+      // The turn never opened, so no terminal event is published either — the
+      // failed sendTurn is what the caller observes. Matches Cursor/Grok.
       assert.lengthOf(started, 0);
-      assert.lengthOf(completed, 1);
-      assert.equal(completed[0]?.payload.state, "cancelled");
+      assert.lengthOf(completed, 0);
       assert.notInclude(requests, '"method":"session/prompt"');
       assert.include(requests, '"method":"session/cancel"');
+
+      const [readySession] = yield* adapter.listSessions();
+      assert.equal(readySession?.status, "ready");
+      assert.isUndefined(readySession?.activeTurnId);
 
       yield* Fiber.interrupt(eventsFiber);
       yield* adapter.stopSession(threadId);

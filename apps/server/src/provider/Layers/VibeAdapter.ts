@@ -618,6 +618,13 @@ export function makeVibeAdapter(settings: VibeSettings, options?: VibeAdapterOpt
         if (!(yield* resetActiveTurn(ctx, turn))) {
           return false;
         }
+        // Match Cursor/Grok: a turn that never published `turn.started` must not
+        // publish a terminal event either. When Stop lands during preparation the
+        // session is reset silently and the failed `sendTurn` is what the caller
+        // observes — no consumer ever saw the turn open.
+        if (!turn.started) {
+          return true;
+        }
         yield* publish({
           type: "turn.completed",
           ...(yield* stamp()),
